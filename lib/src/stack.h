@@ -79,13 +79,21 @@ StackSliceArray ts_stack_pop_all(Stack *self, StackVersion version);
 // since the last error was detected.
 unsigned ts_stack_node_count_since_error(const Stack *self, StackVersion version);
 
+// Get the subtree at the top of the given version of the stack, below the extras at the top.
+// Get NULL_SUBTREE when there is no such subtree. For a merged stack node, use its first link
+// (tree-sitter-cpp fork).
+Subtree ts_stack_top_subtree(const Stack *self, StackVersion version);
+
 int ts_stack_dynamic_precedence(Stack *self, StackVersion version);
 
 bool ts_stack_has_advanced_since_error(const Stack *self, StackVersion version);
 
 // Compute a summary of all the parse states near the top of the given
 // version of the stack and store the summary for later retrieval.
-void ts_stack_record_summary(Stack *self, StackVersion version, unsigned max_depth);
+//
+// The summary does not include the states above `skipped_depth`, and its depths do not count
+// the subtrees above `skipped_depth` (tree-sitter-cpp fork).
+void ts_stack_record_summary(Stack *self, StackVersion version, unsigned max_depth, unsigned skipped_depth);
 
 // Retrieve a summary of all the parse states near the top of the
 // given version of the stack.

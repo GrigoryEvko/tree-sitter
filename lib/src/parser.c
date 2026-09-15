@@ -74,9 +74,25 @@
 
 #define TREE_NAME(tree) SYM_NAME(ts_subtree_symbol(tree))
 
-static const unsigned MAX_VERSION_COUNT = 6;
-static const unsigned MAX_VERSION_COUNT_OVERFLOW = 4;
-static const unsigned MAX_SUMMARY_DEPTH = 16;
+// The number of parse versions that the parser keeps, and the more versions that a reduction can
+// make. A deep C++ template argument list needs more than 6 versions (tree-sitter-cpp fork).
+static const unsigned MAX_VERSION_COUNT = 32;
+static const unsigned MAX_VERSION_COUNT_OVERFLOW = 16;
+// The depth of the stack that error recovery examines for a state that accepts the lookahead. With
+// 16, a C++ file with an error in a deep construct cannot get back to the translation unit at the end
+// of the file, and its root node is ERROR (tree-sitter-cpp fork).
+static const unsigned MAX_SUMMARY_DEPTH = 256;
+// The number of previous states that error recovery goes back to for one lookahead token. The
+// published runtime goes back only to the nearest state that accepts the token. That state can be
+// in the construct that has the error, and a later error then makes a large ERROR node. With more
+// versions, the error costs select the state. On the C++ corpus, 3 gives fewer ERROR bytes than
+// 2, 4, 6, or no limit (tree-sitter-cpp fork).
+static const unsigned MAX_RECOVERY_COUNT = 3;
+// The maximum number of MISSING `}` tokens that error recovery puts at the end of the input for
+// one version (tree-sitter-cpp fork).
+static const unsigned MAX_MISSING_BRACE_COUNT = 256;
+// The maximum number of reductions before one of these MISSING `}` tokens (tree-sitter-cpp fork).
+static const unsigned MAX_MISSING_BRACE_REDUCTION_COUNT = 1024;
 static const unsigned MAX_COST_DIFFERENCE = 18 * ERROR_COST_PER_SKIPPED_TREE;
 static const unsigned OP_COUNT_PER_PARSER_CALLBACK_CHECK = 100;
 
@@ -265,8 +281,10 @@ static ErrorComparison ts_parser__compare_versions(
     }
   }
 
+  // The products use 64 bits. The costs of unmatched brackets make a product of 32 bits overflow
+  // in a large file (tree-sitter-cpp fork).
   if (a.cost < b.cost) {
-    if ((b.cost - a.cost) * (1 + a.node_count) > MAX_COST_DIFFERENCE) {
+    if ((uint64_t)(b.cost - a.cost) * (1 + (uint64_t)a.node_count) > MAX_COST_DIFFERENCE) {
       return ErrorComparisonTakeLeft;
     } else {
       return ErrorComparisonPreferLeft;
@@ -274,7 +292,7 @@ static ErrorComparison ts_parser__compare_versions(
   }
 
   if (b.cost < a.cost) {
-    if ((a.cost - b.cost) * (1 + b.node_count) > MAX_COST_DIFFERENCE) {
+    if ((uint64_t)(a.cost - b.cost) * (1 + (uint64_t)b.node_count) > MAX_COST_DIFFERENCE) {
       return ErrorComparisonTakeRight;
     } else {
       return ErrorComparisonPreferRight;
@@ -292,7 +310,7 @@ static ErrorStatus ts_parser__version_status(
 ) {
   unsigned cost = ts_stack_error_cost(self->stack, version);
   bool is_paused = ts_stack_is_paused(self->stack, version);
-  if (is_paused) cost += ERROR_COST_PER_SKIPPED_TREE;
+  if (is_paused) cost = ts_error_cost_add(cost, ERROR_COST_PER_SKIPPED_TREE);
   return (ErrorStatus) {
     .cost = cost,
     .node_count = ts_stack_node_count_since_error(self->stack, version),
@@ -795,6 +813,12 @@ static Subtree ts_parser__reuse_node(
       reason = "is_missing";
     } else if (ts_subtree_is_fragile(result)) {
       reason = "is_fragile";
+    } else if (ts_subtree_error_cost(result) > 0) {
+      // A node is fragile only when its first or last child is fragile. A node can have an ERROR
+      // or a MISSING node in a different child. Error recovery uses the other versions and the
+      // stack below the node, and a parse with no old tree can recover differently. Parse the
+      // node again (tree-sitter-cpp fork).
+      reason = "has_error";
     } else if (ts_parser__has_included_range_difference(
                  self,
                  byte_offset,
@@ -911,6 +935,64 @@ static bool ts_parser__select_children(
   );
 }
 
+// Push a node of an old tree onto the stack as the subtrees of its right spine: the children
+// before the last child as subtrees, and the last child in the same way, until the last leaf.
+// `state` is the state before the node.
+//
+// A parse with no old tree lexes the token after the node in the state after the last leaf. Then
+// it reduces the spine with that token as the lookahead. The token kind, the keyword check, and
+// the reductions depend on that state and on that token. After this push, the incremental parse
+// has the same stack when it lexes the next token.
+//
+// Return false and push nothing if a child of the spine is an ERROR node, if a node of the spine
+// ends with an extra, or if the table has no state for a child. O(d * c) in the depth and the
+// child count of the node (tree-sitter-cpp fork).
+static bool ts_parser__shift_right_spine(
+  TSParser *self,
+  StackVersion version,
+  TSStateId state,
+  Subtree tree
+) {
+  Subtree node = tree;
+  while (ts_subtree_child_count(node) > 0) {
+    uint32_t count = ts_subtree_child_count(node);
+    const Subtree *children = ts_subtree_children(node);
+    if (ts_subtree_extra(children[count - 1])) return false;
+    for (uint32_t i = 0; i < count; i++) {
+      Subtree child = children[i];
+      if (ts_subtree_is_error(child)) return false;
+      if (i + 1 < count && !ts_subtree_extra(child)) {
+        state = ts_language_next_state(self->language, state, ts_subtree_symbol(child));
+        if (state == 0) return false;
+      }
+    }
+    node = children[count - 1];
+  }
+  if (ts_language_next_state(self->language, state, ts_subtree_symbol(node)) == 0) return false;
+
+  for (node = tree; ts_subtree_child_count(node) > 0;) {
+    uint32_t count = ts_subtree_child_count(node);
+    const Subtree *children = ts_subtree_children(node);
+    for (uint32_t i = 0; i < count; i++) {
+      Subtree child = children[i];
+      if (i + 1 == count && ts_subtree_child_count(child) > 0) break;
+      TSStateId previous = ts_stack_state(self->stack, version);
+      TSStateId next = ts_subtree_extra(child)
+        ? previous
+        : ts_language_next_state(self->language, previous, ts_subtree_symbol(child));
+      ts_subtree_retain(child);
+      ts_stack_push(self->stack, version, child, ts_subtree_child_count(child) > 0, next);
+    }
+    node = children[count - 1];
+  }
+
+  if (ts_subtree_has_external_tokens(tree)) {
+    ts_stack_set_last_external_token(self->stack, version, ts_subtree_last_external_token(tree));
+  }
+  ts_subtree_release(&self->tree_pool, tree);
+  return true;
+}
+
 static void ts_parser__shift(
   TSParser *self,
   StackVersion version,
@@ -934,6 +1016,9 @@ static void ts_parser__shift(
   }
 }
 
+// With `merge_versions` false, the new versions do not merge with other versions. Error recovery
+// can then remove the new versions and leave the other versions as they were (tree-sitter-cpp
+// fork).
 static StackVersion ts_parser__reduce(
   TSParser *self,
   StackVersion version,
@@ -942,7 +1027,8 @@ static StackVersion ts_parser__reduce(
   int dynamic_precedence,
   uint16_t production_id,
   bool is_fragile,
-  bool end_of_non_terminal_extra
+  bool end_of_non_terminal_extra,
+  bool merge_versions
 ) {
   uint32_t initial_version_count = ts_stack_version_count(self->stack);
 
@@ -1036,7 +1122,7 @@ static StackVersion ts_parser__reduce(
       ts_stack_push(self->stack, slice_version, *array_get(&self->trailing_extras, j), false, next_state);
     }
 
-    for (StackVersion j = 0; j < slice_version; j++) {
+    for (StackVersion j = 0; merge_versions && j < slice_version; j++) {
       if (j == version) continue;
       if (ts_stack_merge(self->stack, j, slice_version)) {
         removed_version_count++;
@@ -1133,6 +1219,19 @@ static bool ts_parser__process_candidate_recovery_actions(
   return has_shift_action;
 }
 
+// Do the reductions of `starting_version` for `lookahead_symbol`, or for all symbols if it is 0.
+// Return true if a version can shift the lookahead symbol.
+//
+// A state with more than one reduce action, or a stack node with more than one link, makes more
+// than one version. The version of the last reduction replaces the current version, and the other
+// versions go after the initial versions. After the starting version, the loop does the reductions
+// of each added version. With a lookahead symbol, the loop removes each version that cannot shift
+// the symbol.
+//
+// Error recovery keeps a version with a MISSING token only if the version can shift the lookahead.
+// A version that cannot shift it detects the same error at the same position again. The skip of a
+// right brace has a higher cost than the MISSING token. Each recovery then adds one more MISSING
+// token at that position, and the error costs become larger than 32 bits (tree-sitter-cpp fork).
 static bool ts_parser__do_all_potential_reductions(
   TSParser *self,
   StackVersion starting_version,
@@ -1141,13 +1240,15 @@ static bool ts_parser__do_all_potential_reductions(
   uint32_t initial_version_count = ts_stack_version_count(self->stack);
 
   bool can_shift_lookahead_symbol = false;
+  bool is_starting_version = true;
+  StackVersion first_added_version = initial_version_count;
   StackVersion version = starting_version;
   for (unsigned i = 0; true; i++) {
     uint32_t version_count = ts_stack_version_count(self->stack);
     if (version >= version_count) break;
 
     bool merged = false;
-    for (StackVersion j = initial_version_count; j < version; j++) {
+    for (StackVersion j = first_added_version; j < version; j++) {
       if (ts_stack_merge(self->stack, j, version)) {
         merged = true;
         break;
@@ -1196,10 +1297,11 @@ static bool ts_parser__do_all_potential_reductions(
       reduction_version = ts_parser__reduce(
         self, version, action.symbol, action.count,
         action.dynamic_precedence, action.production_id,
-        true, false
+        true, false, true
       );
     }
 
+    bool did_remove = false;
     if (has_shift_action) {
       can_shift_lookahead_symbol = true;
     } else if (reduction_version != STACK_VERSION_NONE && i < MAX_VERSION_COUNT) {
@@ -1207,11 +1309,16 @@ static bool ts_parser__do_all_potential_reductions(
       continue;
     } else if (lookahead_symbol != 0) {
       ts_stack_remove_version(self->stack, version);
+      did_remove = true;
     }
 
-    if (version == starting_version) {
-      version = version_count;
-    } else {
+    // The added versions start at `first_added_version`. A removal moves each version after the
+    // removed version down by one index (tree-sitter-cpp fork).
+    if (is_starting_version) {
+      is_starting_version = false;
+      if (did_remove) first_added_version--;
+      version = first_added_version;
+    } else if (!did_remove) {
       version++;
     }
   }
@@ -1291,11 +1398,22 @@ static void ts_parser__recover(
   Subtree lookahead
 ) {
   bool did_recover = false;
+  unsigned recovery_count = 0;
   unsigned previous_version_count = ts_stack_version_count(self->stack);
   Length position = ts_stack_position(self->stack, version);
   StackSummary *summary = ts_stack_get_summary(self->stack, version);
   unsigned node_count_since_error = ts_stack_node_count_since_error(self->stack, version);
   unsigned current_error_cost = ts_stack_error_cost(self->stack, version);
+
+  // A version in the error state can have no summary. A merge keeps the summary of one version
+  // only. A reduction of a non-terminal extra, for example a directive, makes a new version with
+  // no summary. Without a summary, the version skips each token until the end of the file. Record
+  // the summary of the stack below the ERROR at the top. The depths then agree with the summary
+  // of ts_parser__handle_error (tree-sitter-cpp fork).
+  if (!summary) {
+    ts_stack_record_summary(self->stack, version, MAX_SUMMARY_DEPTH, node_count_since_error > 0 ? 1 : 0);
+    summary = ts_stack_get_summary(self->stack, version);
+  }
 
   // When the parser is in the error state, there are two strategies for recovering with a
   // given lookahead token:
@@ -1332,21 +1450,24 @@ static void ts_parser__recover(
       if (would_merge) continue;
 
       // Do not recover if the result would clearly be worse than some existing stack version.
-      unsigned new_cost =
-        current_error_cost +
-        entry.depth * ERROR_COST_PER_SKIPPED_TREE +
-        (position.bytes - entry.position.bytes) * ERROR_COST_PER_SKIPPED_CHAR +
-        (position.extent.row - entry.position.extent.row) * ERROR_COST_PER_SKIPPED_LINE;
+      // The cost stops at ERROR_COST_MAX (tree-sitter-cpp fork).
+      unsigned new_cost = ts_error_cost_add(
+        current_error_cost,
+        (uint64_t)entry.depth * ERROR_COST_PER_SKIPPED_TREE +
+        (uint64_t)(position.bytes - entry.position.bytes) * ERROR_COST_PER_SKIPPED_CHAR +
+        (uint64_t)(position.extent.row - entry.position.extent.row) * ERROR_COST_PER_SKIPPED_LINE
+      );
       if (ts_parser__better_version_exists(self, version, false, new_cost)) break;
 
       // If the current lookahead token is valid in some previous state, recover to that state.
-      // Then stop looking for further recoveries.
+      // Stop after MAX_RECOVERY_COUNT recoveries.
       if (ts_language_has_actions(self->language, entry.state, ts_subtree_symbol(lookahead))) {
         if (ts_parser__recover_to_state(self, version, depth, entry.state)) {
           did_recover = true;
+          recovery_count++;
           LOG("recover_to_previous state:%u, depth:%u", entry.state, depth);
           LOG_STACK();
-          break;
+          if (recovery_count == MAX_RECOVERY_COUNT) break;
         }
       }
     }
@@ -1394,10 +1515,19 @@ static void ts_parser__recover(
   }
 
   // Do not recover if the result would clearly be worse than some existing stack version.
-  unsigned new_cost =
-    current_error_cost + ERROR_COST_PER_SKIPPED_TREE +
-    ts_subtree_total_bytes(lookahead) * ERROR_COST_PER_SKIPPED_CHAR +
-    ts_subtree_total_size(lookahead).extent.row * ERROR_COST_PER_SKIPPED_LINE;
+  // The ERROR at the top of the stack and the lookahead become one ERROR. Include the cost of the
+  // right brackets of the lookahead that this ERROR does not match. The cost stops at ERROR_COST_MAX
+  // (tree-sitter-cpp fork).
+  Subtree top_error = node_count_since_error > 0
+    ? ts_stack_top_subtree(self->stack, version)
+    : NULL_SUBTREE;
+  unsigned new_cost = ts_error_cost_add(
+    current_error_cost,
+    ERROR_COST_PER_SKIPPED_TREE +
+    (uint64_t)ts_subtree_total_bytes(lookahead) * ERROR_COST_PER_SKIPPED_CHAR +
+    (uint64_t)ts_subtree_total_size(lookahead).extent.row * ERROR_COST_PER_SKIPPED_LINE +
+    ts_subtree_unmatched_bracket_cost_after(top_error, lookahead, self->language)
+  );
   if (ts_parser__better_version_exists(self, version, false, new_cost)) {
     ts_stack_halt(self->stack, version);
     ts_subtree_release(&self->tree_pool, lookahead);
@@ -1474,6 +1604,130 @@ static void ts_parser__recover(
   self->has_error = has_error;
 }
 
+// On the copy `copy` of a version, do the reductions for a `symbol` lookahead. Return the state after
+// a shift of `symbol`, or 0 if the reductions get to no shift. In each state, the reductions use the
+// shift action if the state has one, and the first reduce action if not. The reductions do not
+// merge the copy with other versions. A stack with more than one path gives more than one version,
+// and the copy keeps the first version. O(r * s) in the reductions and the stack size
+// (tree-sitter-cpp fork).
+static TSStateId ts_parser__reduce_for_missing_token(
+  TSParser *self,
+  StackVersion copy,
+  TSSymbol symbol
+) {
+  TSStateId state = ts_stack_state(self->stack, copy);
+  for (unsigned reductions = 0; reductions < MAX_MISSING_BRACE_REDUCTION_COUNT; reductions++) {
+    TableEntry entry;
+    ts_language_table_entry(self->language, state, symbol, &entry);
+    const TSParseAction *reduce = NULL;
+    for (uint32_t i = 0; i < entry.action_count; i++) {
+      const TSParseAction *action = &entry.actions[i];
+      if (action->type == TSParseActionTypeShift && !action->shift.extra && !action->shift.repetition) {
+        return ts_language_shift_state(self->language, action);
+      } else if (action->type == TSParseActionTypeReduce && !reduce) {
+        reduce = action;
+      }
+    }
+    if (!reduce) return 0;
+
+    StackVersion reduced = ts_parser__reduce(
+      self, copy, reduce->reduce.symbol, reduce->reduce.child_count,
+      reduce->reduce.dynamic_precedence, reduce->reduce.production_id,
+      entry.action_count > 1, false, false
+    );
+    if (reduced == STACK_VERSION_NONE) return 0;
+    ts_stack_renumber_version(self->stack, reduced, copy);
+    while (ts_stack_version_count(self->stack) > copy + 1) {
+      ts_stack_remove_version(self->stack, copy + 1);
+    }
+    state = ts_stack_state(self->stack, copy);
+  }
+  return 0;
+}
+
+// Close the open braces of a version at the end of the input with MISSING `}` tokens.
+//
+// A single missing token closes one construct only. For each unclosed block, GCC reports
+// "expected '}' at end of input" and Clang reports "expected '}'", and they keep the constructs
+// of all the blocks (cp_parser_require in gcc/cp/parser.cc, Parser::ExpectAndConsume in
+// clang/lib/Parse/Parser.cpp).
+//
+// On a copy of `version`, do the reductions for a `}` lookahead, and push a missing `}`. Do this
+// again until the end of the input has a reduce action. Each `}` must have a reduce action for
+// the end of the input or for one more `}`. Keep the copy only when the sequence gets to such a
+// state. Return true if the copy stays.
+//
+// The `}` of a class, an enumeration, or an initializer list ends no declaration. The state after
+// that `}` has no reduce action for the end of the input or for `}`. Then do the reductions for a
+// `;` lookahead, and push a missing `;`. GCC reports "expected ';' after class definition"
+// (cp_parser_class_specifier in gcc/cp/parser.cc), and Clang reports "expected ';' after struct"
+// (Parser::ParseClassSpecifier in clang/lib/Parse/ParseDeclCXX.cpp).
+//
+// The reductions do not merge the copy with other versions. When the sequence stops, the other
+// versions are the same as before. O(n * s) in the missing tokens and the stack size
+// (tree-sitter-cpp fork).
+static bool ts_parser__insert_missing_braces(
+  TSParser *self,
+  StackVersion version,
+  Length position,
+  Subtree lookahead
+) {
+  TSSymbol brace = 0;
+  TSSymbol semicolon = 0;
+  for (TSSymbol symbol = 1; symbol < self->language->token_count; symbol++) {
+    const char *name = ts_language_symbol_name(self->language, symbol);
+    if (!name || name[0] == 0 || name[1] != 0) continue;
+    if (name[0] == '}' && brace == 0) brace = symbol;
+    if (name[0] == ';' && semicolon == 0) semicolon = symbol;
+  }
+  if (brace == 0) return false;
+
+  ts_lexer_reset(&self->lexer, position);
+  ts_lexer_mark_end(&self->lexer);
+  Length padding = length_sub(self->lexer.token_end_position, position);
+  uint32_t lookahead_bytes = ts_subtree_total_bytes(lookahead) + ts_subtree_lookahead_bytes(lookahead);
+  TSSymbol end_symbol = ts_subtree_leaf_symbol(lookahead);
+
+  StackVersion copy = ts_stack_copy_version(self->stack, version);
+  for (unsigned count = 0; count < MAX_MISSING_BRACE_COUNT; count++) {
+    TSStateId state_after_brace = ts_parser__reduce_for_missing_token(self, copy, brace);
+    TSStateId state_before_brace = ts_stack_state(self->stack, copy);
+    if (state_after_brace == 0 || state_after_brace == state_before_brace) break;
+
+    Subtree missing_tree = ts_subtree_new_missing_leaf(
+      &self->tree_pool, brace, state_before_brace, padding, lookahead_bytes, self->language
+    );
+    ts_stack_push(self->stack, copy, missing_tree, false, state_after_brace);
+    TSStateId state = state_after_brace;
+
+    if (
+      semicolon != 0 &&
+      !ts_language_has_reduce_action(self->language, state, end_symbol) &&
+      !ts_language_has_reduce_action(self->language, state, brace)
+    ) {
+      TSStateId state_after_semicolon = ts_parser__reduce_for_missing_token(self, copy, semicolon);
+      TSStateId state_before_semicolon = ts_stack_state(self->stack, copy);
+      if (state_after_semicolon == 0 || state_after_semicolon == state_before_semicolon) break;
+      Subtree missing_semicolon = ts_subtree_new_missing_leaf(
+        &self->tree_pool, semicolon, state_before_semicolon, padding, lookahead_bytes, self->language
+      );
+      ts_stack_push(self->stack, copy, missing_semicolon, false, state_after_semicolon);
+      state = state_after_semicolon;
+    }
+
+    if (ts_language_has_reduce_action(self->language, state, end_symbol)) {
+      LOG("recover_with_missing_braces count:%u, state:%u", count + 1, state);
+      return true;
+    }
+    if (!ts_language_has_reduce_action(self->language, state, brace)) break;
+  }
+
+  while (ts_stack_version_count(self->stack) > copy) {
+    ts_stack_remove_version(self->stack, copy);
+  }
+  return false;
+}
+
 static void ts_parser__handle_error(
   TSParser *self,
   StackVersion version,
@@ -1545,6 +1799,10 @@ static void ts_parser__handle_error(
           }
         }
       }
+
+      if (!did_insert_missing_token && ts_subtree_is_eof(lookahead)) {
+        did_insert_missing_token = ts_parser__insert_missing_braces(self, v, position, lookahead);
+      }
     }
 
     ts_stack_push(self->stack, v, NULL_SUBTREE, false, ERROR_STATE);
@@ -1556,7 +1814,7 @@ static void ts_parser__handle_error(
     ts_assert(did_merge);
   }
 
-  ts_stack_record_summary(self->stack, version, MAX_SUMMARY_DEPTH);
+  ts_stack_record_summary(self->stack, version, MAX_SUMMARY_DEPTH, 0);
 
   // Begin recovery with the current lookahead node, rather than waiting for the
   // next turn of the parse loop. This ensures that the tree accounts for the
@@ -1666,8 +1924,22 @@ static bool ts_parser__advance(
             next_state = state;
             LOG("shift_extra");
           } else {
-            next_state = action.shift.state;
+            next_state = ts_language_shift_state(self->language, &action);
             LOG("shift state:%u", next_state);
+          }
+
+          // The parser reuses a node of the old tree only when the stack has one version. The
+          // reductions for the node can make more versions. A parse with no old tree shifts the
+          // first leaf of the node in each version, and the versions can merge after that leaf.
+          // If one version shifts the full node, the versions do not merge at the same position,
+          // and a different link or a different tree stays. Shift the first leaf
+          // (tree-sitter-cpp fork).
+          if (ts_subtree_child_count(lookahead) > 0 && ts_stack_version_count(self->stack) > 1) {
+            LOG("breakdown_lookahead_with_versions sym:%s", TREE_NAME(lookahead));
+            ts_subtree_release(&self->tree_pool, lookahead);
+            while (reusable_node_descend(&self->reusable_node)) {}
+            lookahead = reusable_node_tree(&self->reusable_node);
+            ts_subtree_retain(lookahead);
           }
 
           if (ts_subtree_child_count(lookahead) > 0) {
@@ -1675,7 +1947,15 @@ static bool ts_parser__advance(
             next_state = ts_language_next_state(self->language, state, ts_subtree_symbol(lookahead));
           }
 
-          ts_parser__shift(self, version, next_state, lookahead, action.shift.extra);
+          if (
+            !action.shift.extra &&
+            ts_subtree_child_count(lookahead) > 0 &&
+            ts_parser__shift_right_spine(self, version, state, lookahead)
+          ) {
+            LOG("shift_right_spine state:%u", ts_stack_state(self->stack, version));
+          } else {
+            ts_parser__shift(self, version, next_state, lookahead, action.shift.extra);
+          }
           if (did_reuse) reusable_node_advance(&self->reusable_node);
           return true;
         }
@@ -1687,7 +1967,7 @@ static bool ts_parser__advance(
           StackVersion reduction_version = ts_parser__reduce(
             self, version, action.reduce.symbol, action.reduce.child_count,
             action.reduce.dynamic_precedence, action.reduce.production_id,
-            is_fragile, end_of_non_terminal_extra
+            is_fragile, end_of_non_terminal_extra, true
           );
           did_reduce = true;
           if (reduction_version != STACK_VERSION_NONE) {
@@ -1751,6 +2031,20 @@ static bool ts_parser__advance(
       return true;
     }
 
+    // If the lookahead is a node of the old tree that has no action, replace it with its first
+    // leaf. A parse with no old tree has that leaf as the lookahead here. The leaf can be a keyword
+    // that the parse reads as the word token below. If the node stays, the parser detects an error
+    // and skips the node (tree-sitter-cpp fork).
+    if (did_reuse && lookahead.ptr && ts_subtree_child_count(lookahead) > 0) {
+      LOG("breakdown_lookahead_without_action sym:%s", TREE_NAME(lookahead));
+      ts_subtree_release(&self->tree_pool, lookahead);
+      while (reusable_node_descend(&self->reusable_node)) {}
+      lookahead = reusable_node_tree(&self->reusable_node);
+      ts_subtree_retain(lookahead);
+      ts_language_table_entry(self->language, state, ts_subtree_symbol(lookahead), &table_entry);
+      continue;
+    }
+
     // If the current lookahead token is a keyword that is not valid, but the
     // default word token *is* valid, then treat the lookahead token as the word
     // token instead.
@@ -1806,6 +2100,31 @@ static bool ts_parser__advance(
     ts_stack_pause(self->stack, version, lookahead);
     return true;
   }
+}
+
+// Merge the version `version` with a version before it. Return true if the merge removed `version`,
+// and the caller subtracts one from its index.
+//
+// The version loop of one parse step gives each version its own head, also where two versions shift
+// the same token into the same state. Only the condense step at the end of the loop merges them.
+// The list then holds more versions than the mid-step limit of `ts_parser__reduce`, and that limit
+// drops a reduction by the index of its version. The reading of a deep template argument list then
+// depends on the state numbers of the parse table, and not on the dynamic precedences of the
+// grammar.
+//
+// The caller calls this function for each version that completes its turn. The function removes no
+// reading, because a merge keeps the two readings as two links of one node. It removes no version
+// that a comparison makes unnecessary, although the condense step removes such a version. A version
+// that has no turn yet can still get a lower error cost, and a removal before the condense step also
+// takes the candidates of the recovery of an error (tree-sitter-cpp fork).
+static bool ts_parser__merge_finished_version(TSParser *self, StackVersion version) {
+  for (StackVersion j = 0; j < version; j++) {
+    if (ts_stack_merge(self->stack, j, version)) {
+      LOG("merge_finished_version version:%u into:%u", version, j);
+      return true;
+    }
+  }
+  return false;
 }
 
 static unsigned ts_parser__condense_stack(TSParser *self) {
@@ -2036,10 +2355,7 @@ bool ts_parser_set_language(TSParser *self, const TSLanguage *language) {
   self->language = NULL;
 
   if (language) {
-    if (
-      language->abi_version > TREE_SITTER_LANGUAGE_VERSION ||
-      language->abi_version < TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION
-    ) return false;
+    if (!ts_language_version_is_supported(language->abi_version)) return false;
 
     if (!ts_language_is_parseable(language)) return false;
 
@@ -2179,7 +2495,7 @@ TSTree *ts_parser_parse(
       bool allow_node_reuse = version_count == 1;
       while (ts_stack_is_active(self->stack, version)) {
         LOG(
-          "process version:%u, version_count:%u, state:%d, row:%u, col:%u",
+          "process version:%u, version_count:%u, state:%u, row:%u, col:%u",
           version,
           ts_stack_version_count(self->stack),
           ts_stack_state(self->stack, version),
@@ -2199,6 +2515,16 @@ TSTree *ts_parser_parse(
           last_position = position;
           break;
         }
+      }
+
+      // The version completed its turn. A merge with a version before it stops the list from
+      // growing past the mid-step limit of `ts_parser__reduce`. The list is already longer than the
+      // condense step at the end of the loop keeps (tree-sitter-cpp fork).
+      if (
+        ts_stack_version_count(self->stack) > MAX_VERSION_COUNT &&
+        ts_parser__merge_finished_version(self, version)
+      ) {
+        version--;
       }
     }
 

@@ -25,12 +25,25 @@ extern "C" {
  * assigned an ABI version number that corresponds to the current CLI version.
  * The Tree-sitter library is generally backwards-compatible with languages
  * generated using older CLI versions, but is not forwards-compatible.
+ *
+ * The tree-sitter-cpp fork adds two ABI versions, far from the upstream
+ * versions, and an upstream library does not read a parser of the fork.
+ * ABI 1015 is the layout of ABI 15 with 32-bit values in the parse tables,
+ * 32-bit primary state ids, and a 32-bit state in a shift action. ABI 1016 adds
+ * the shape layout of the parse tables, which holds each distinct row shape one
+ * time. This library reads the ABI versions 13 thru 15, 1015 and 1016 in the
+ * same process, and it reads the tables of each language in the layout of its
+ * version. The generator in vendor/tree-sitter-generate writes the version
+ * 1016.
  */
-#define TREE_SITTER_LANGUAGE_VERSION 15
+#define TREE_SITTER_LANGUAGE_VERSION 1016
 
 /**
  * The earliest ABI version that is supported by the current version of the
  * library.
+ *
+ * The library of the tree-sitter-cpp fork does not read the versions 16 thru
+ * 1014.
  */
 #define TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION 13
 
@@ -38,7 +51,9 @@ extern "C" {
 /* Section - Types */
 /*******************/
 
-typedef uint16_t TSStateId;
+// A parse state id: a maximum of 4,294,967,295 states. The tree-sitter-cpp fork uses 32 bits, and
+// src/parser.h gives the limits of the parse tables.
+typedef uint32_t TSStateId;
 typedef uint16_t TSSymbol;
 typedef uint16_t TSFieldId;
 typedef struct TSLanguage TSLanguage;

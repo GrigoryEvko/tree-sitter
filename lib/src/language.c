@@ -56,6 +56,14 @@ uint32_t ts_language_current_context_id(void) {
 
 #endif
 
+// A shift action keeps the offsets of the 16-bit state and of the flags of ABI 13 thru 15. Refer to
+// `TSParseAction` (tree-sitter-cpp fork).
+_Static_assert(sizeof(TSParseAction) == 8, "a parse action has 8 bytes");
+_Static_assert(offsetof(TSParseAction, shift.state_low) == 2, "the 16-bit shift state is at offset 2");
+_Static_assert(offsetof(TSParseAction, shift.extra) == 4, "the extra flag of a shift is at offset 4");
+_Static_assert(offsetof(TSParseAction, shift.repetition) == 5, "the repetition flag of a shift is at offset 5");
+_Static_assert(offsetof(TSParseAction, shift.state_high) == 6, "the high shift state is at offset 6");
+
 const TSLanguage *ts_language_copy(const TSLanguage *self) {
 #ifdef __wasm__
   if (ts_language__is_unparseable(self)) {
@@ -251,7 +259,7 @@ TSStateId ts_language_next_state(
     if (count > 0) {
       TSParseAction action = actions[count - 1];
       if (action.type == TSParseActionTypeShift) {
-        return action.shift.extra ? state : action.shift.state;
+        return action.shift.extra ? state : ts_language_shift_state(self, &action);
       }
     }
     return 0;

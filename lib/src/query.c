@@ -1426,7 +1426,7 @@ static void ts_query__perform_analysis(
           const TSParseAction *action = &lookahead_iterator.actions[lookahead_iterator.action_count - 1];
           if (action->type == TSParseActionTypeShift) {
             if (!action->shift.extra) {
-              successor.state = action->shift.state;
+              successor.state = ts_language_shift_state(self->language, action);
               successor.child_index++;
             }
           } else {
@@ -1765,7 +1765,7 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
   //      with information about the node that would be created.
   //   3) A list of predecessor states for each state.
   StatePredecessorMap predecessor_map = state_predecessor_map_new(self->language);
-  for (TSStateId state = 1; state < (uint16_t)self->language->state_count; state++) {
+  for (TSStateId state = 1; state < self->language->state_count; state++) {
     unsigned subgraph_index, exists;
     LookaheadIterator lookahead_iterator = ts_language_lookaheads(self->language, state);
     while (ts_lookahead_iterator__next(&lookahead_iterator)) {
@@ -1801,7 +1801,7 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
               }
             }
           } else if (action->type == TSParseActionTypeShift && !action->shift.extra) {
-            TSStateId next_state = action->shift.state;
+            TSStateId next_state = ts_language_shift_state(self->language, action);
             state_predecessor_map_add(&predecessor_map, next_state, state);
           }
         }
@@ -3026,8 +3026,7 @@ TSQuery *ts_query_new(
 ) {
   if (
     !language ||
-    language->abi_version > TREE_SITTER_LANGUAGE_VERSION ||
-    language->abi_version < TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION
+    !ts_language_version_is_supported(language->abi_version)
   ) {
     *error_type = TSQueryErrorLanguage;
     return NULL;

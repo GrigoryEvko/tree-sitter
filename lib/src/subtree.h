@@ -15,7 +15,9 @@ extern "C" {
 #include "tree_sitter/api.h"
 #include "./parser.h"
 
-#define TS_TREE_STATE_NONE USHRT_MAX
+// The parse state of a subtree that the parser does not reuse as one node. The state ids have 32 bits
+// (tree-sitter-cpp fork).
+#define TS_TREE_STATE_NONE UINT32_MAX
 #define NULL_SUBTREE ((Subtree) {.ptr = NULL})
 
 // The serialized state of an external scanner.
@@ -47,6 +49,9 @@ typedef struct {
 // Because of alignment, for any valid pointer this will be 0, giving
 // us the opportunity to make use of this bit to signify whether to use
 // the pointer or the inline struct.
+//
+// The inline struct keeps the parse state in 16 bits. A leaf with a parse state of UINT16_MAX or more
+// is a heap subtree (tree-sitter-cpp fork).
 typedef struct SubtreeInlineData SubtreeInlineData;
 
 #define SUBTREE_BITS    \
@@ -103,6 +108,16 @@ struct SubtreeInlineData {
 #undef SUBTREE_BITS
 #undef SUBTREE_SIZE
 
+// The left and right brackets of a sequence of tokens that have no match in the sequence. Braces
+// have two counts. Parentheses and square brackets have the two other counts. A count stops at
+// UINT16_MAX (tree-sitter-cpp fork).
+typedef struct {
+  uint16_t left_braces;
+  uint16_t right_braces;
+  uint16_t left_parentheses;
+  uint16_t right_parentheses;
+} UnmatchedBrackets;
+
 // A heap-allocated representation of a subtree.
 //
 // This representation is used for parent nodes, external tokens,
@@ -143,6 +158,9 @@ typedef struct {
         TSSymbol symbol;
         TSStateId parse_state;
       } first_leaf;
+      // The brackets of an ERROR node that have no match in the node. Zero in other nodes
+      // (tree-sitter-cpp fork).
+      UnmatchedBrackets unmatched;
     };
 
     // External terminal subtrees (`child_count == 0 && has_external_tokens`)
@@ -223,6 +241,7 @@ int ts_subtree_compare(Subtree left, Subtree right, SubtreePool *pool);
 void ts_subtree_set_symbol(MutableSubtree *self, TSSymbol symbol, const TSLanguage *language);
 void ts_subtree_compress(MutableSubtree self, unsigned count, const TSLanguage *language, MutableSubtreeArray *stack);
 void ts_subtree_summarize_children(MutableSubtree self, const TSLanguage *language);
+uint32_t ts_subtree_unmatched_bracket_cost_after(Subtree error, Subtree tree, const TSLanguage *language);
 Subtree ts_subtree_edit(Subtree self, const TSInputEdit *edit, SubtreePool *pool);
 char *ts_subtree_string(Subtree self, TSSymbol alias_symbol, bool alias_is_named, const TSLanguage *language, bool include_all);
 void ts_subtree_print_dot_graph(Subtree self, const TSLanguage *language, FILE *f);

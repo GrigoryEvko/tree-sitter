@@ -536,7 +536,7 @@ TSStateId ts_node_parse_state(TSNode self) {
 
 TSStateId ts_node_next_parse_state(TSNode self) {
   const TSLanguage *language = self.tree->language;
-  uint16_t state = ts_node_parse_state(self);
+  TSStateId state = ts_node_parse_state(self);
   if (state == TS_TREE_STATE_NONE) {
     return TS_TREE_STATE_NONE;
   }

@@ -64,8 +64,11 @@ struct GeneratedParser {
 }
 
 // NOTE: This constant must be kept in sync with the definition of
-// `TREE_SITTER_LANGUAGE_VERSION` in `lib/include/tree_sitter/api.h`.
-const LANGUAGE_VERSION: usize = 15;
+// `TREE_SITTER_LANGUAGE_VERSION` in `vendor/tree-sitter/include/tree_sitter/api.h`.
+//
+// The ABI of the tree-sitter-cpp fork: the layout of ABI 15 with 32-bit state ids and with the parse
+// tables in the shape layout.
+const LANGUAGE_VERSION: usize = 1016;
 
 pub const ALLOC_HEADER: &str = include_str!("templates/alloc.h");
 pub const ARRAY_HEADER: &str = include_str!("templates/array.h");
@@ -727,7 +730,7 @@ mod tests {
     use super::{LANGUAGE_VERSION, PARSER_HEADER};
     #[test]
     fn test_language_versions_are_in_sync() {
-        let api_h = include_str!("../../../lib/include/tree_sitter/api.h");
+        let api_h = include_str!("../../tree-sitter/include/tree_sitter/api.h");
         let api_language_version = api_h
             .lines()
             .find_map(|line| {
@@ -741,10 +744,10 @@ mod tests {
 
     #[test]
     fn test_parser_header_in_sync() {
-        let parser_h = include_str!("../../../lib/src/parser.h");
+        let parser_h = include_str!("../../tree-sitter/src/parser.h");
         assert!(
             parser_h == PARSER_HEADER,
-            "parser.h.inc is out of sync with lib/src/parser.h. Run: cp lib/src/parser.h crates/generate/src/parser.h.inc"
+            "parser.h.inc is out of sync with vendor/tree-sitter/src/parser.h. Run: cp vendor/tree-sitter/src/parser.h vendor/tree-sitter-generate/src/parser.h.inc"
         );
     }
 }

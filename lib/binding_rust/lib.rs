@@ -58,6 +58,24 @@ pub const LANGUAGE_VERSION: usize = ffi::TREE_SITTER_LANGUAGE_VERSION as usize;
 pub const MIN_COMPATIBLE_LANGUAGE_VERSION: usize =
     ffi::TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION as usize;
 
+/// The last upstream ABI version that the library reads (tree-sitter-cpp fork).
+pub const UPSTREAM_LANGUAGE_VERSION: usize = 15;
+
+/// The first ABI version of the fork: 32-bit parse tables (tree-sitter-cpp fork).
+pub const WIDE_TABLE_LANGUAGE_VERSION: usize = 1015;
+
+/// True when the library reads the ABI version `version` (tree-sitter-cpp fork).
+///
+/// The library reads [`MIN_COMPATIBLE_LANGUAGE_VERSION`] thru [`UPSTREAM_LANGUAGE_VERSION`], with 16-bit
+/// parse tables, [`WIDE_TABLE_LANGUAGE_VERSION`], with 32-bit parse tables, and [`LANGUAGE_VERSION`],
+/// with the parse tables in the shape layout. It does not read the versions between them.
+#[must_use]
+pub const fn is_supported_language_version(version: usize) -> bool {
+    (version >= MIN_COMPATIBLE_LANGUAGE_VERSION && version <= UPSTREAM_LANGUAGE_VERSION)
+        || version == WIDE_TABLE_LANGUAGE_VERSION
+        || version == LANGUAGE_VERSION
+}
+
 pub const PARSER_HEADER: &str = include_str!("../src/parser.h");
 
 /// An opaque object that defines how to parse a particular language. The code
@@ -693,7 +711,7 @@ impl Language {
     /// ```
     #[doc(alias = "ts_language_next_state")]
     #[must_use]
-    pub fn next_state(&self, state: u16, id: u16) -> u16 {
+    pub fn next_state(&self, state: u32, id: u16) -> u32 {
         unsafe { ffi::ts_language_next_state(self.0, state, id) }
     }
 
@@ -718,7 +736,7 @@ impl Language {
     /// to be considered during error recovery.
     #[doc(alias = "ts_lookahead_iterator_new")]
     #[must_use]
-    pub fn lookahead_iterator(&self, state: u16) -> Option<LookaheadIterator> {
+    pub fn lookahead_iterator(&self, state: u32) -> Option<LookaheadIterator> {
         let ptr = unsafe { ffi::ts_lookahead_iterator_new(self.0, state) };
         (!ptr.is_null()).then(|| unsafe { LookaheadIterator::from_raw(ptr) })
     }
@@ -777,7 +795,7 @@ impl Parser {
     #[doc(alias = "ts_parser_set_language")]
     pub fn set_language(&mut self, language: &Language) -> Result<(), LanguageError> {
         let version = language.abi_version();
-        if (MIN_COMPATIBLE_LANGUAGE_VERSION..=LANGUAGE_VERSION).contains(&version) {
+        if is_supported_language_version(version) {
             if !language.is_parseable() {
                 return Err(LanguageError::NotParseable);
             }
@@ -1749,14 +1767,14 @@ impl<'tree> Node<'tree> {
     /// consider multiple stack versions.
     #[doc(alias = "ts_node_parse_state")]
     #[must_use]
-    pub fn parse_state(&self) -> u16 {
+    pub fn parse_state(&self) -> u32 {
         unsafe { ffi::ts_node_parse_state(self.0) }
     }
 
     /// Get the parse state after this node.
     #[doc(alias = "ts_node_next_parse_state")]
     #[must_use]
-    pub fn next_parse_state(&self) -> u16 {
+    pub fn next_parse_state(&self) -> u32 {
         unsafe { ffi::ts_node_next_parse_state(self.0) }
     }
 
@@ -2421,7 +2439,7 @@ impl LookaheadIterator {
     /// This returns `true` if the language was set successfully and `false`
     /// otherwise.
     #[doc(alias = "ts_lookahead_iterator_reset")]
-    pub fn reset(&mut self, language: &Language, state: u16) -> bool {
+    pub fn reset(&mut self, language: &Language, state: u32) -> bool {
         unsafe { ffi::ts_lookahead_iterator_reset(self.0.as_ptr(), language.0, state) }
     }
 
@@ -2430,7 +2448,7 @@ impl LookaheadIterator {
     /// This returns `true` if the iterator was reset to the given state and
     /// `false` otherwise.
     #[doc(alias = "ts_lookahead_iterator_reset_state")]
-    pub fn reset_state(&mut self, state: u16) -> bool {
+    pub fn reset_state(&mut self, state: u32) -> bool {
         unsafe { ffi::ts_lookahead_iterator_reset_state(self.0.as_ptr(), state) }
     }
 
@@ -3904,7 +3922,7 @@ impl fmt::Display for LanguageError {
             Self::Version(version) => {
                 write!(
                     f,
-                    "Incompatible language version {version}. Expected minimum {MIN_COMPATIBLE_LANGUAGE_VERSION}, maximum {LANGUAGE_VERSION}",
+                    "Incompatible language version {version}. Expected {MIN_COMPATIBLE_LANGUAGE_VERSION} thru {UPSTREAM_LANGUAGE_VERSION}, or {LANGUAGE_VERSION}",
                 )
             }
             Self::NotParseable => {

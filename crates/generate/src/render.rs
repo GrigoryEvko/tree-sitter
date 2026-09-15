@@ -27,15 +27,38 @@ use super::{
 };
 
 const SMALL_STATE_THRESHOLD: usize = 64;
-pub const ABI_VERSION_MIN: usize = 14;
+// The generator writes only the ABI of the tree-sitter-cpp fork: 32-bit parse table values and state
+// ids. With an upstream version number, an upstream runtime reads these tables incorrectly.
+pub const ABI_VERSION_MIN: usize = LANGUAGE_VERSION;
 pub const ABI_VERSION_MAX: usize = LANGUAGE_VERSION;
 const ABI_VERSION_WITH_RESERVED_WORDS: usize = 15;
+// The generator wraps a large array of positional initializers at this column. A designator for each
+// element costs more text than the element (tree-sitter-cpp fork).
+const WRAP_COLUMN: usize = 100;
 
 pub type RenderResult<T> = Result<T, RenderError>;
 
+/// Put a line break in the buffer when the current line is 100 characters or longer.
+///
+/// `line_start` is the offset of the start of the current line. The function moves it to the new
+/// line. The caller writes one array element and then calls this function.
+fn wrap_array_line(buffer: &mut String, line_start: &mut usize) {
+    if buffer.len() - *line_start >= WRAP_COLUMN {
+        buffer.push('\n');
+        *line_start = buffer.len();
+    }
+}
+
+/// Put a line break after the last element of an array, when that line holds one element or more.
+fn end_array_line(buffer: &mut String, line_start: usize) {
+    if buffer.len() > line_start {
+        buffer.push('\n');
+    }
+}
+
 #[derive(Debug, Error, Serialize, Deserialize)]
 pub enum RenderError {
-    #[error("Parse table action count {0} exceeds maximum value of {max}", max=u16::MAX)]
+    #[error("Parse table action count {0} exceeds maximum value of {max}", max=u32::MAX)]
     ParseTable(usize),
     #[error(
         "This version of Tree-sitter can only generate parsers with ABI version {ABI_VERSION_MIN} - {ABI_VERSION_MAX}, not {0}"
@@ -685,15 +708,17 @@ impl Generator {
             self,
             "static const TSStateId ts_primary_state_ids[STATE_COUNT] = {{"
         );
-        indent!(self);
+        // The array is dense and in state order, so the initializers are positional.
+        let mut line_start = self.buffer.len();
         let mut first_state_for_each_core_id = FxHashMap::default();
         for (idx, state) in self.parse_table.states.iter().enumerate() {
-            let primary_state = first_state_for_each_core_id
+            let primary_state = *first_state_for_each_core_id
                 .entry(state.core_id)
                 .or_insert(idx);
-            add_line!(self, "[{idx}] = {primary_state},");
+            add!(self, "{primary_state},");
+            wrap_array_line(&mut self.buffer, &mut line_start);
         }
-        dedent!(self);
+        end_array_line(&mut self.buffer, line_start);
         add_line!(self, "}};");
         add_line!(self, "");
     }
@@ -857,9 +882,10 @@ impl Generator {
     }
 
     fn add_lex_function(&mut self, name: &str, lex_table: LexTable) {
+        // A lex function takes a 16-bit lex state, as `TSLanguage.lex_fn` says (tree-sitter-cpp fork).
         add_line!(
             self,
-            "static bool {name}(TSLexer *lexer, TSStateId state) {{",
+            "static bool {name}(TSLexer *lexer, uint16_t state) {{",
         );
         indent!(self);
 
@@ -1179,43 +1205,45 @@ impl Generator {
     }
 
     fn add_lex_modes(&mut self) {
+        let has_reserved_words = self.abi_version >= ABI_VERSION_WITH_RESERVED_WORDS;
         add_line!(
             self,
             "static const {} ts_lex_modes[STATE_COUNT] = {{",
-            if self.abi_version >= ABI_VERSION_WITH_RESERVED_WORDS {
+            if has_reserved_words {
                 "TSLexerMode"
             } else {
                 "TSLexMode"
             }
         );
-        indent!(self);
-        for (i, state) in self.parse_table.states.iter().enumerate() {
-            add_whitespace!(self);
-            add!(self, "[{i}] = {{");
-            if state.is_end_of_non_terminal_extra() {
-                add!(self, "(TSStateId)(-1),");
+        // The initializers are positional. The field order of the two structs in parser.h is the lex
+        // state, the external lex state, and for TSLexerMode the reserved word set id.
+        let mut line_start = self.buffer.len();
+        for i in 0..self.parse_table.states.len() {
+            // The lex state has 16 bits, and a state id has 32 bits (tree-sitter-cpp fork). The lex
+            // state 65535 identifies the end of a non-terminal extra.
+            let is_end_of_extra = self.parse_table.states[i].is_end_of_non_terminal_extra();
+            let (lex_state, external_lex_state) = if is_end_of_extra {
+                (u32::from(u16::MAX), 0)
             } else {
-                add!(self, ".lex_state = {}", state.lex_state_id);
-
-                if state.external_lex_state_id > 0 {
-                    add!(
-                        self,
-                        ", .external_lex_state = {}",
-                        state.external_lex_state_id
-                    );
-                }
-
-                if self.abi_version >= ABI_VERSION_WITH_RESERVED_WORDS {
-                    let reserved_word_set_id = self.reserved_word_set_ids_by_parse_state[i];
-                    if reserved_word_set_id != 0 {
-                        add!(self, ", .reserved_word_set_id = {reserved_word_set_id}");
-                    }
-                }
+                let state = &self.parse_table.states[i];
+                (state.lex_state_id, state.external_lex_state_id)
+            };
+            if has_reserved_words {
+                let reserved_word_set_id = if is_end_of_extra {
+                    0
+                } else {
+                    self.reserved_word_set_ids_by_parse_state[i]
+                };
+                add!(
+                    self,
+                    "{{{lex_state},{external_lex_state},{reserved_word_set_id}}},"
+                );
+            } else {
+                add!(self, "{{{lex_state},{external_lex_state}}},");
             }
-
-            add!(self, "}},\n");
+            wrap_array_line(&mut self.buffer, &mut line_start);
         }
-        dedent!(self);
+        end_array_line(&mut self.buffer, line_start);
         add_line!(self, "}};");
         add_line!(self, "");
     }
@@ -1305,6 +1333,49 @@ impl Generator {
         add_line!(self, "");
     }
 
+    /// The numeric id of a symbol in `enum ts_symbol_identifiers`.
+    ///
+    /// The end of a non-terminal extra takes the id of the end of the input. `init` gives the two the
+    /// same identifier, and the parse tables keep them in the same cell.
+    fn symbol_number(&self, symbol: Symbol) -> u16 {
+        if symbol == Symbol::end_of_nonterminal_extra() {
+            return 0;
+        }
+        self.symbol_order[&symbol] as u16
+    }
+
+    /// Write one array of numbers, with a line break at approximately 100 columns.
+    ///
+    /// C has no array of zero elements, so an empty array takes one element with the value 0. Each
+    /// offset of such an array is 0, and the runtime reads no element of it.
+    fn add_value_array<T: std::fmt::Display>(&mut self, ctype: &str, name: &str, values: &[T]) {
+        add_line!(self, "static const {ctype} {name}[{}] = {{", values.len().max(1));
+        let mut line_start = self.buffer.len();
+        if values.is_empty() {
+            add!(self, "0,");
+        }
+        for value in values {
+            add!(self, "{value},");
+            wrap_array_line(&mut self.buffer, &mut line_start);
+        }
+        end_array_line(&mut self.buffer, line_start);
+        add_line!(self, "}};");
+        add_line!(self, "");
+    }
+
+    /// Write the parse tables in the shape layout (tree-sitter-cpp fork).
+    ///
+    /// A GROUP of a state is a maximal set of symbols that share one table value. The SHAPE of a
+    /// state is the ordered list of its symbols together with the group of each symbol, in the order
+    /// in which the runtime reads them. Many states share one shape, and a column of a shape is
+    /// frequently one value for each state of that shape. The arrays hold each shape one time, and
+    /// for each state only the values of the columns that are not constant.
+    ///
+    /// The order of the symbols of a shape is the order of the iteration of the runtime: ascending
+    /// symbol for a large state, and group order for a small state. `ts_language_lookaheads` reads
+    /// the symbols in that order, so a change of the order changes a tree.
+    ///
+    /// O(n) in the entries of the parse tables, plus O(g) in the groups for the constant columns.
     fn add_parse_table(&mut self) -> RenderResult<()> {
         let mut parse_table_entries = FxHashMap::default();
         let mut next_parse_action_list_index = 0u32;
@@ -1318,90 +1389,74 @@ impl Generator {
             &mut next_parse_action_list_index,
         );
 
-        add_line!(
-            self,
-            "static const uint16_t ts_parse_table[LARGE_STATE_COUNT][SYMBOL_COUNT] = {{",
-        );
-        indent!(self);
+        let state_count = self.parse_table.states.len();
 
+        // ---- 1. the entries of each state, in the order in which the runtime reads them ----
+        // A value has 32 bits: an index in `ts_parse_actions` for a terminal, or the next state for
+        // a non-terminal (tree-sitter-cpp fork).
+        let mut entry_symbol: Vec<u16> = Vec::new();
+        let mut entry_value: Vec<u32> = Vec::new();
+        let mut entry_offset: Vec<u32> = Vec::with_capacity(state_count + 1);
         let mut terminal_entries = Vec::new();
-        let mut nonterminal_entries = Vec::new();
+        let mut row: Vec<(u16, u32)> = Vec::new();
+        let mut symbols_by_value = FxHashMap::<(u32, SymbolType), Vec<Symbol>>::default();
 
-        for (i, state) in self
-            .parse_table
-            .states
-            .iter()
-            .enumerate()
-            .take(self.large_state_count)
-        {
-            add_line!(self, "[STATE({i})] = {{");
-            indent!(self);
+        for (i, state) in self.parse_table.states.iter().enumerate() {
+            entry_offset.push(entry_symbol.len() as u32);
+            row.clear();
 
-            // Ensure the entries are in a deterministic order, since they are
-            // internally represented as a hash map.
+            // The entries come from a hash map, so each order below is an explicit sort.
             terminal_entries.clear();
-            nonterminal_entries.clear();
             terminal_entries.extend(state.terminal_entries.iter());
-            nonterminal_entries.extend(state.nonterminal_entries.iter());
             terminal_entries.sort_unstable_by_key(|e| self.symbol_order.get(e.0));
-            nonterminal_entries.sort_unstable_by_key(|k| k.0);
 
-            for (symbol, action) in &nonterminal_entries {
-                add_line!(
-                    self,
-                    "[{}] = STATE({}),",
-                    self.symbol_ids[symbol],
-                    match action {
-                        GotoAction::Goto(state) => *state as usize,
-                        GotoAction::ShiftExtra => i,
-                    }
-                );
-            }
-
-            for (symbol, id) in &terminal_entries {
-                let entry_id = Self::get_parse_action_list_id(
-                    **id,
-                    &self.parse_table.action_lists,
-                    &mut parse_table_entries,
-                    &mut next_parse_action_list_index,
-                );
-                add_line!(self, "[{}] = ACTIONS({entry_id}),", self.symbol_ids[symbol]);
-            }
-
-            dedent!(self);
-            add_line!(self, "}},");
-        }
-
-        dedent!(self);
-        add_line!(self, "}};");
-        add_line!(self, "");
-
-        if self.large_state_count < self.parse_table.states.len() {
-            add_line!(self, "static const uint16_t ts_small_parse_table[] = {{");
-            indent!(self);
-
-            let mut next_table_index = 0;
-            let mut small_state_indices = Vec::with_capacity(
-                self.parse_table
-                    .states
-                    .len()
-                    .saturating_sub(self.large_state_count),
-            );
-            let mut symbols_by_value = FxHashMap::<(u32, SymbolType), Vec<Symbol>>::default();
-            for state in self.parse_table.states.iter().skip(self.large_state_count) {
-                small_state_indices.push(next_table_index);
-                symbols_by_value.clear();
-
-                terminal_entries.clear();
-                terminal_entries.extend(state.terminal_entries.iter());
-                terminal_entries.sort_unstable_by_key(|e| self.symbol_order.get(e.0));
-
-                // In a given parse state, many lookahead symbols have the same actions.
-                // So in the "small state" representation, group symbols by their action
-                // in order to avoid repeating the action.
-                for (symbol, entry) in &terminal_entries {
+            if i < self.large_state_count {
+                // A large state was a dense row, and the runtime read it in ascending symbol order.
+                for (symbol, action) in &state.nonterminal_entries {
+                    let value = match action {
+                        GotoAction::Goto(next) => *next,
+                        GotoAction::ShiftExtra => i as u32,
+                    };
+                    row.push((self.symbol_number(*symbol), value));
+                }
+                for (symbol, id) in &terminal_entries {
                     let entry_id = Self::get_parse_action_list_id(
-                        **entry,
+                        **id,
+                        &self.parse_table.action_lists,
+                        &mut parse_table_entries,
+                        &mut next_parse_action_list_index,
+                    );
+                    row.push((self.symbol_number(**symbol), entry_id));
+                }
+                // The dense row of a large state took one cell for each symbol, so a symbol with two
+                // entries kept the value that the text wrote last. The sort is stable, and the order
+                // of the two entries is the order in which the text wrote them.
+                row.sort_by_key(|entry| entry.0);
+                row.dedup_by(|later, earlier| {
+                    if later.0 == earlier.0 {
+                        earlier.1 = later.1;
+                        return true;
+                    }
+                    false
+                });
+                // A cell of the dense row with the value 0 was a cell with no entry. The large branch
+                // of `ts_lookahead_iterator__next` reads a cell and steps to the next symbol while
+                // the value is 0, so it gives no symbol for such a cell. The row drops the entry.
+                // `GotoAction::ShiftExtra` of the state 0 gives four cells of that kind.
+                //
+                // The small branch of the same function reads each symbol of each group and tests no
+                // value, so it gives a symbol whose group holds the value 0. A small state below
+                // keeps such an entry. The two rules come from the two branches of the runtime, and
+                // not from the grammar of today.
+                row.retain(|entry| entry.1 != 0);
+            } else {
+                // A small state keeps its symbols in groups, and the runtime reads the groups in the
+                // order that this sort gives them. Many lookahead symbols of one state have the same
+                // value, and one group holds all of them.
+                symbols_by_value.clear();
+                for (symbol, id) in &terminal_entries {
+                    let entry_id = Self::get_parse_action_list_id(
+                        **id,
                         &self.parse_table.action_lists,
                         &mut parse_table_entries,
                         &mut next_parse_action_list_index,
@@ -1412,71 +1467,187 @@ impl Generator {
                         .push(**symbol);
                 }
                 for (symbol, action) in &state.nonterminal_entries {
-                    let state_id = match action {
-                        GotoAction::Goto(i) => *i,
-                        GotoAction::ShiftExtra => {
-                            (self.large_state_count + small_state_indices.len() - 1) as u32
-                        }
+                    let value = match action {
+                        GotoAction::Goto(next) => *next,
+                        GotoAction::ShiftExtra => i as u32,
                     };
                     symbols_by_value
-                        .entry((state_id, SymbolType::NonTerminal))
+                        .entry((value, SymbolType::NonTerminal))
                         .or_default()
                         .push(*symbol);
                 }
-
                 let mut values_with_symbols = symbols_by_value.drain().collect::<Vec<_>>();
                 values_with_symbols.sort_unstable_by_key(|((value, kind), symbols)| {
                     (symbols.len(), *kind, *value, symbols[0])
                 });
-
-                add_line!(
-                    self,
-                    "[{next_table_index}] = {},",
-                    values_with_symbols.len()
-                );
-                indent!(self);
-                next_table_index += 1;
-
-                for ((value, kind), symbols) in &mut values_with_symbols {
-                    next_table_index += 2 + symbols.len();
-                    if *kind == SymbolType::NonTerminal {
-                        add_line!(self, "STATE({value}), {},", symbols.len());
-                    } else {
-                        add_line!(self, "ACTIONS({value}), {},", symbols.len());
-                    }
-
+                // A small state keeps a symbol with two entries in two groups, and the search of the
+                // runtime gives the value of the group that comes first. It also keeps an entry with
+                // the value 0, because the runtime gives a symbol for it. Refer to the large branch
+                // above.
+                for ((value, _), symbols) in &mut values_with_symbols {
                     symbols.sort_unstable();
-                    indent!(self);
-                    for symbol in symbols {
-                        add_line!(self, "{},", self.symbol_ids[symbol]);
+                    for symbol in symbols.iter() {
+                        row.push((self.symbol_number(*symbol), *value));
                     }
-                    dedent!(self);
                 }
-
-                dedent!(self);
             }
 
-            dedent!(self);
-            add_line!(self, "}};");
-            add_line!(self, "");
-
-            add_line!(
-                self,
-                "static const uint32_t ts_small_parse_table_map[] = {{"
-            );
-            indent!(self);
-            for i in self.large_state_count..self.parse_table.states.len() {
-                add_line!(
-                    self,
-                    "[SMALL_STATE({i})] = {},",
-                    small_state_indices[i - self.large_state_count]
-                );
+            for &(symbol, value) in &row {
+                entry_symbol.push(symbol);
+                entry_value.push(value);
             }
-            dedent!(self);
-            add_line!(self, "}};");
-            add_line!(self, "");
         }
-        if next_parse_action_list_index >= u32::from(u16::MAX) {
+        entry_offset.push(entry_symbol.len() as u32);
+
+        // ---- 2. the shape of each state ----
+        // The key of a shape is the symbols of the state and the group of each of them. The group
+        // comes from the first use of a value, in the order of the iteration. The shape ids come
+        // from a first-use walk over the states in index order, and never from the order of a hash
+        // map, so that two runs of the generator write the same file.
+        let mut shape_of_key = FxHashMap::<Vec<u16>, u32>::default();
+        let mut shape_symbol_list: Vec<Vec<u16>> = Vec::new();
+        let mut shape_group_list: Vec<Vec<u16>> = Vec::new();
+        let mut state_shape: Vec<u32> = Vec::with_capacity(state_count);
+        let mut state_group_value: Vec<Vec<u32>> = Vec::with_capacity(state_count);
+        let mut group_of_value = FxHashMap::<u32, u16>::default();
+        let mut key: Vec<u16> = Vec::new();
+
+        for i in 0..state_count {
+            let start = entry_offset[i] as usize;
+            let end = entry_offset[i + 1] as usize;
+            group_of_value.clear();
+            let mut values: Vec<u32> = Vec::new();
+            key.clear();
+            key.extend_from_slice(&entry_symbol[start..end]);
+            for &value in &entry_value[start..end] {
+                let group = *group_of_value.entry(value).or_insert_with(|| {
+                    let group = values.len() as u16;
+                    values.push(value);
+                    group
+                });
+                key.push(group);
+            }
+            let shape = if let Some(&shape) = shape_of_key.get(&key) {
+                shape
+            } else {
+                let shape = shape_symbol_list.len() as u32;
+                shape_of_key.insert(key.clone(), shape);
+                shape_symbol_list.push(entry_symbol[start..end].to_vec());
+                shape_group_list.push(key[end - start..].to_vec());
+                shape
+            };
+            state_shape.push(shape);
+            state_group_value.push(values);
+        }
+
+        // ---- 3. the constant columns of each shape ----
+        // A column of a shape is constant when each state of that shape has one value there. The
+        // variable columns take the slots 0 thru nvar-1 in column order, and the constant columns
+        // take the slots that follow, also in column order.
+        let shape_count = shape_symbol_list.len();
+        let mut states_of_shape: Vec<Vec<u32>> = vec![Vec::new(); shape_count];
+        for (i, &shape) in state_shape.iter().enumerate() {
+            states_of_shape[shape as usize].push(i as u32);
+        }
+        let mut shape_nvar: Vec<u16> = Vec::with_capacity(shape_count);
+        let mut shape_slot_of_group: Vec<Vec<u16>> = Vec::with_capacity(shape_count);
+        let mut shape_constant: Vec<Vec<u32>> = Vec::with_capacity(shape_count);
+        for states in &states_of_shape {
+            let first = states[0] as usize;
+            let group_count = state_group_value[first].len();
+            let mut is_variable = vec![false; group_count];
+            for &state in &states[1..] {
+                let values = &state_group_value[state as usize];
+                for group in 0..group_count {
+                    if values[group] != state_group_value[first][group] {
+                        is_variable[group] = true;
+                    }
+                }
+            }
+            let mut slot_of_group = vec![0u16; group_count];
+            let mut nvar = 0u16;
+            for group in 0..group_count {
+                if is_variable[group] {
+                    slot_of_group[group] = nvar;
+                    nvar += 1;
+                }
+            }
+            let mut constants = Vec::new();
+            let mut slot = nvar;
+            for group in 0..group_count {
+                if !is_variable[group] {
+                    slot_of_group[group] = slot;
+                    slot += 1;
+                    constants.push(state_group_value[first][group]);
+                }
+            }
+            shape_nvar.push(nvar);
+            shape_slot_of_group.push(slot_of_group);
+            shape_constant.push(constants);
+        }
+
+        // ---- 4. the nine arrays ----
+        let mut shape_symbols: Vec<u16> = Vec::new();
+        let mut shape_slots: Vec<u16> = Vec::new();
+        let mut shape_offset: Vec<u32> = Vec::with_capacity(shape_count + 1);
+        let mut shape_const: Vec<u32> = Vec::new();
+        let mut shape_const_offset: Vec<u32> = Vec::with_capacity(shape_count + 1);
+        shape_offset.push(0);
+        shape_const_offset.push(0);
+        for shape in 0..shape_count {
+            shape_symbols.extend_from_slice(&shape_symbol_list[shape]);
+            for &group in &shape_group_list[shape] {
+                shape_slots.push(shape_slot_of_group[shape][group as usize]);
+            }
+            shape_offset.push(shape_symbols.len() as u32);
+            shape_const.extend_from_slice(&shape_constant[shape]);
+            shape_const_offset.push(shape_const.len() as u32);
+        }
+        let mut state_value_offset: Vec<u32> = Vec::with_capacity(state_count);
+        let mut state_values: Vec<u32> = Vec::new();
+        for i in 0..state_count {
+            state_value_offset.push(state_values.len() as u32);
+            let shape = state_shape[i] as usize;
+            let nvar = shape_nvar[shape] as usize;
+            let base = state_values.len();
+            state_values.resize(base + nvar, 0);
+            for (group, &value) in state_group_value[i].iter().enumerate() {
+                let slot = shape_slot_of_group[shape][group] as usize;
+                if slot < nvar {
+                    state_values[base + slot] = value;
+                }
+            }
+        }
+
+        add_line!(
+            self,
+            "// The parse tables in the shape layout. `ts_state_shape` gives the shape of a state,"
+        );
+        add_line!(
+            self,
+            "// and `ts_shape_offset` gives the range of that shape in `ts_shape_symbols` and in"
+        );
+        add_line!(
+            self,
+            "// `ts_shape_slots`. A slot below `ts_shape_nvar` reads `ts_state_values`, and a higher"
+        );
+        add_line!(
+            self,
+            "// slot reads `ts_shape_const`. Refer to `ts_language_lookup` in language.h."
+        );
+        self.add_value_array("TSSymbol", "ts_shape_symbols", &shape_symbols);
+        self.add_value_array("uint16_t", "ts_shape_slots", &shape_slots);
+        self.add_value_array("uint32_t", "ts_shape_offset", &shape_offset);
+        self.add_value_array("uint16_t", "ts_shape_nvar", &shape_nvar);
+        self.add_value_array("uint32_t", "ts_shape_const", &shape_const);
+        self.add_value_array("uint32_t", "ts_shape_const_offset", &shape_const_offset);
+        self.add_value_array("uint32_t", "ts_state_shape", &state_shape);
+        self.add_value_array("uint32_t", "ts_state_value_offset", &state_value_offset);
+        self.add_value_array("uint32_t", "ts_state_values", &state_values);
+
+        // The parse tables keep an index in `ts_parse_actions` in 32 bits (tree-sitter-cpp fork).
+        // `get_parse_action_list_id` stops the count at u32::MAX.
+        if next_parse_action_list_index == u32::MAX {
             Err(RenderError::ParseTable(
                 next_parse_action_list_index as usize,
             ))?;
@@ -1493,33 +1664,43 @@ impl Generator {
     }
 
     fn add_parse_action_list(&mut self, parse_table_entries: Vec<(u32, ActionListId)>) {
+        // A short macro for each parse action macro of parser.h. The array holds millions of
+        // actions, and the short name saves approximately one half of the text.
+        add_line!(self, "#define E(c, r) {{.entry = {{.count = c, .reusable = r}}}}");
+        add_line!(self, "#define S(s) SHIFT(s)");
+        add_line!(self, "#define SR(s) SHIFT_REPEAT(s)");
+        add_line!(self, "#define SX() SHIFT_EXTRA()");
+        add_line!(self, "#define R(s, c, p, i) REDUCE(s, c, p, i)");
+        add_line!(self, "#define RC() RECOVER()");
+        add_line!(self, "#define AC() ACCEPT_INPUT()");
+        add_line!(self, "");
         add_line!(
             self,
             "static const TSParseActionEntry ts_parse_actions[] = {{"
         );
-        indent!(self);
-        for (i, id) in parse_table_entries {
+        // `get_parse_action_list_id` gives the indexes in order, so the initializers are positional.
+        let mut line_start = self.buffer.len();
+        for (_, id) in parse_table_entries {
             let actions = self.parse_table.action_lists.get(id);
             add!(
                 self,
-                "  [{i}] = {{.entry = {{.count = {}, .reusable = {}}}}},",
+                "E({},{}),",
                 actions.len(),
-                id.reusable(),
+                u8::from(id.reusable()),
             );
             for action in actions {
-                add!(self, " ");
                 match *action {
-                    ParseAction::Accept => add!(self, " ACCEPT_INPUT()"),
-                    ParseAction::Recover => add!(self, "RECOVER()"),
-                    ParseAction::ShiftExtra => add!(self, "SHIFT_EXTRA()"),
+                    ParseAction::Accept => add!(self, "AC()"),
+                    ParseAction::Recover => add!(self, "RC()"),
+                    ParseAction::ShiftExtra => add!(self, "SX()"),
                     ParseAction::Shift {
                         state,
                         is_repetition,
                     } => {
                         if is_repetition {
-                            add!(self, "SHIFT_REPEAT({state})");
+                            add!(self, "SR({state})");
                         } else {
-                            add!(self, "SHIFT({state})");
+                            add!(self, "S({state})");
                         }
                     }
                     ParseAction::Reduce {
@@ -1529,19 +1710,28 @@ impl Generator {
                         production_id,
                         ..
                     } => {
+                        // The numeric symbol id, because the symbol name costs much more text.
                         add!(
                             self,
-                            "REDUCE({}, {child_count}, {dynamic_precedence}, {production_id})",
-                            self.symbol_ids[&symbol]
+                            "R({},{child_count},{dynamic_precedence},{production_id})",
+                            self.symbol_order[&symbol]
                         );
                     }
                 }
                 add!(self, ",");
             }
-            add!(self, "\n");
+            wrap_array_line(&mut self.buffer, &mut line_start);
         }
-        dedent!(self);
+        end_array_line(&mut self.buffer, line_start);
         add_line!(self, "}};");
+        add_line!(self, "");
+        add_line!(self, "#undef E");
+        add_line!(self, "#undef S");
+        add_line!(self, "#undef SR");
+        add_line!(self, "#undef SX");
+        add_line!(self, "#undef R");
+        add_line!(self, "#undef RC");
+        add_line!(self, "#undef AC");
         add_line!(self, "");
     }
 
@@ -1609,12 +1799,8 @@ impl Generator {
             ".max_alias_sequence_length = MAX_ALIAS_SEQUENCE_LENGTH,"
         );
 
-        // Parse table
-        add_line!(self, ".parse_table = &ts_parse_table[0][0],");
-        if self.large_state_count < self.parse_table.states.len() {
-            add_line!(self, ".small_parse_table = ts_small_parse_table,");
-            add_line!(self, ".small_parse_table_map = ts_small_parse_table_map,");
-        }
+        // Parse tables. `parse_table`, `small_parse_table` and `small_parse_table_map` stay null,
+        // because the shape layout replaces them (tree-sitter-cpp fork).
         add_line!(self, ".parse_actions = ts_parse_actions,");
 
         // Metadata
@@ -1692,6 +1878,17 @@ impl Generator {
             add_line!(self, "}},");
         }
 
+        // The parse tables in the shape layout, the last fields of TSLanguage (tree-sitter-cpp fork).
+        add_line!(self, ".shape_symbols = ts_shape_symbols,");
+        add_line!(self, ".shape_slots = ts_shape_slots,");
+        add_line!(self, ".shape_offset = ts_shape_offset,");
+        add_line!(self, ".shape_nvar = ts_shape_nvar,");
+        add_line!(self, ".shape_const = ts_shape_const,");
+        add_line!(self, ".shape_const_offset = ts_shape_const_offset,");
+        add_line!(self, ".state_shape = ts_state_shape,");
+        add_line!(self, ".state_value_offset = ts_state_value_offset,");
+        add_line!(self, ".state_values = ts_state_values,");
+
         dedent!(self);
         add_line!(self, "}};");
         add_line!(self, "return &language;");
@@ -1713,7 +1910,10 @@ impl Generator {
         } else {
             let result = *next_parse_action_list_index;
             parse_action_list_offsets.insert(id, result);
-            *next_parse_action_list_index += 1 + pool.get(id).len() as u32;
+            // The count stops at u32::MAX, and `add_parse_table` then rejects the tables
+            // (tree-sitter-cpp fork).
+            *next_parse_action_list_index =
+                next_parse_action_list_index.saturating_add(1 + pool.get(id).len() as u32);
             result
         }
     }

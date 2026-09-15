@@ -123,7 +123,9 @@ pub fn build_tables(
         );
     }
 
-    if parse_table.states.len() > u16::MAX as usize {
+    // A state id has 32 bits, and the runtime uses UINT32_MAX for a subtree with no state
+    // (tree-sitter-cpp fork).
+    if parse_table.states.len() > u32::MAX as usize {
         Err(ParseTableBuilderError::StateCount(parse_table.states.len()))?;
     }
 

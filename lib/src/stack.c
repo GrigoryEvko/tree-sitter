@@ -8,9 +8,11 @@
 #include <inttypes.h>
 #include <stdio.h>
 
-#define MAX_LINK_COUNT 8
+// The links of one stack node to the nodes before it, and the paths of one pop. The merged versions
+// of a deep C++ template argument list need more than 8 links and 64 paths (tree-sitter-cpp fork).
+#define MAX_LINK_COUNT 32
 #define MAX_NODE_POOL_SIZE 50
-#define MAX_ITERATOR_COUNT 64
+#define MAX_ITERATOR_COUNT 512
 
 #if defined _WIN32 && !defined __GNUC__
 #define forceinline __forceinline
@@ -165,7 +167,8 @@ static StackNode *stack_node_new(
     node->node_count = previous_node->node_count;
 
     if (subtree.ptr) {
-      node->error_cost += ts_subtree_error_cost(subtree);
+      // The cost stops at ERROR_COST_MAX (tree-sitter-cpp fork).
+      node->error_cost = ts_error_cost_add(node->error_cost, ts_subtree_error_cost(subtree));
       node->position = length_add(node->position, ts_subtree_total_size(subtree));
       node->node_count += stack__subtree_node_count(subtree);
       node->dynamic_precedence += ts_subtree_dynamic_precedence(subtree);
@@ -496,7 +499,7 @@ unsigned ts_stack_error_cost(const Stack *self, StackVersion version) {
   if (
     head->status == StackStatusPaused ||
     (head->node->state == ERROR_STATE && !head->node->links[0].subtree.ptr)) {
-    result += ERROR_COST_PER_RECOVERY;
+    result = ts_error_cost_add(result, ERROR_COST_PER_RECOVERY);
   }
   return result;
 }
@@ -507,6 +510,17 @@ unsigned ts_stack_node_count_since_error(const Stack *self, StackVersion version
     head->node_count_at_last_error = head->node->node_count;
   }
   return head->node->node_count - head->node_count_at_last_error;
+}
+
+Subtree ts_stack_top_subtree(const Stack *self, StackVersion version) {
+  const StackNode *node = array_get(&self->heads, version)->node;
+  while (node->link_count > 0) {
+    Subtree subtree = node->links[0].subtree;
+    if (!subtree.ptr) break;
+    if (!ts_subtree_extra(subtree)) return subtree;
+    node = node->links[0].node;
+  }
+  return NULL_SUBTREE;
 }
 
 void ts_stack_push(
@@ -601,12 +615,14 @@ StackSliceArray ts_stack_pop_all(Stack *self, StackVersion version) {
 typedef struct {
   StackSummary *summary;
   unsigned max_depth;
+  unsigned skipped_depth;
 } SummarizeStackSession;
 
 forceinline StackAction summarize_stack_callback(void *payload, const StackIterator *iterator) {
   SummarizeStackSession *session = payload;
   TSStateId state = iterator->node->state;
-  unsigned depth = iterator->subtree_count;
+  if (iterator->subtree_count < session->skipped_depth) return StackActionNone;
+  unsigned depth = iterator->subtree_count - session->skipped_depth;
   if (depth > session->max_depth) return StackActionStop;
   for (unsigned i = session->summary->size - 1; i + 1 > 0; i--) {
     StackSummaryEntry entry = *array_get(session->summary, i);
@@ -621,10 +637,11 @@ forceinline StackAction summarize_stack_callback(void *payload, const StackItera
   return StackActionNone;
 }
 
-void ts_stack_record_summary(Stack *self, StackVersion version, unsigned max_depth) {
+void ts_stack_record_summary(Stack *self, StackVersion version, unsigned max_depth, unsigned skipped_depth) {
   SummarizeStackSession session = {
     .summary = ts_malloc(sizeof(StackSummary)),
-    .max_depth = max_depth
+    .max_depth = max_depth,
+    .skipped_depth = skipped_depth,
   };
   array_init(session.summary);
   stack__iter(self, version, summarize_stack_callback, &session, -1);
@@ -851,7 +868,7 @@ bool ts_stack_print_dot_graph(Stack *self, const TSLanguage *language, FILE *f) 
       ) {
         fprintf(f, "shape=point margin=0 label=\"\"");
       } else {
-        fprintf(f, "label=\"%d\"", node->state);
+        fprintf(f, "label=\"%u\"", node->state);
       }
 
       fprintf(

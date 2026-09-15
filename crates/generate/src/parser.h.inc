@@ -14,8 +14,15 @@ extern "C" {
 #define TREE_SITTER_SERIALIZATION_BUFFER_SIZE 1024
 
 #ifndef TREE_SITTER_API_H_
-typedef uint16_t TSStateId;
+// A parse state id. The runtime and the parsers of the tree-sitter-cpp fork keep a state in 32 bits. A
+// parser of the fork has a maximum of 4,294,967,295 states, because the runtime uses UINT32_MAX for a
+// subtree with no state. A parser of ABI 13 thru 15 keeps a state in 16 bits.
+typedef uint32_t TSStateId;
+// A symbol id. A parser has a maximum of 65,534 symbols and aliases, because the two largest values
+// are the error symbols.
 typedef uint16_t TSSymbol;
+// A field id. A parser has a maximum of 32,767 fields, because the query analysis keeps a field id in
+// 15 bits.
 typedef uint16_t TSFieldId;
 typedef struct TSLanguage TSLanguage;
 typedef struct TSLanguageMetadata {
@@ -27,11 +34,13 @@ typedef struct TSLanguageMetadata {
 
 typedef struct {
   TSFieldId field_id;
+  // The index of the child in the production: a maximum of 255.
   uint8_t child_index;
   bool inherited;
 } TSFieldMapEntry;
 
 // Used to index the field and supertype maps.
+// The start of a slice has a maximum of 65,535, and a slice has a maximum of 65,535 entries.
 typedef struct {
   uint16_t index;
   uint16_t length;
@@ -64,17 +73,26 @@ typedef enum {
 } TSParseActionType;
 
 typedef union {
+  // A shift action keeps the low 16 bits of the state at the offset of the 16-bit state of ABI 13 thru
+  // 15, and the high 16 bits after the flags, where ABI 13 thru 15 have padding. The flags have the same
+  // offsets in each ABI. The runtime reads the state with `ts_language_shift_state` (tree-sitter-cpp
+  // fork).
   struct {
     uint8_t type;
-    TSStateId state;
+    uint16_t state_low;
     bool extra;
     bool repetition;
+    uint16_t state_high;
   } shift;
   struct {
     uint8_t type;
+    // A production has a maximum of 255 children. The query analysis keeps this count in 7 bits, and
+    // a production in a query has a maximum of 127 children.
     uint8_t child_count;
     TSSymbol symbol;
+    // The dynamic precedence of a production: -32,768 thru 32,767.
     int16_t dynamic_precedence;
+    // A parser has a maximum of 65,536 production ids.
     uint16_t production_id;
   } reduce;
   uint8_t type;
@@ -85,6 +103,9 @@ typedef struct {
   uint16_t external_lex_state;
 } TSLexMode;
 
+// A parser has a maximum of 65,535 lex states, because the lex state UINT16_MAX identifies the end of
+// a non-terminal extra. A parser has a maximum of 65,536 external lex states and 65,536 reserved word
+// sets.
 typedef struct {
   uint16_t lex_state;
   uint16_t external_lex_state;
@@ -94,6 +115,7 @@ typedef struct {
 typedef union {
   TSParseAction action;
   struct {
+    // The actions for one state and one token: a maximum of 255.
     uint8_t count;
     bool reusable;
   } entry;
@@ -115,8 +137,15 @@ struct TSLanguage {
   uint32_t production_id_count;
   uint32_t field_count;
   uint16_t max_alias_sequence_length;
-  const uint16_t *parse_table;
-  const uint16_t *small_parse_table;
+  // The parse tables of ABI 13 thru 1015. A value has 16 bits in ABI 13 thru 15, and 32 bits in ABI
+  // 1015 of the tree-sitter-cpp fork. For a token, the value is the index of its actions in
+  // `parse_actions`, and for a non-terminal, the value is the next state. `small_parse_table` also
+  // keeps the counts of its groups and symbols. The runtime reads the values with the width of the ABI
+  // of the language. A parser of the fork has a maximum of 4,294,967,294 action slots. The index of a
+  // large state in `parse_table` is state * symbol_count + symbol, in 32 bits.
+  // ABI 1016 keeps these three pointers null and uses the shape layout at the end of this struct.
+  const void *parse_table;
+  const void *small_parse_table;
   const uint32_t *small_parse_table_map;
   const TSParseActionEntry *parse_actions;
   const char * const *symbol_names;
@@ -128,8 +157,9 @@ struct TSLanguage {
   const uint16_t *alias_map;
   const TSSymbol *alias_sequences;
   const TSLexerMode *lex_modes;
-  bool (*lex_fn)(TSLexer *, TSStateId);
-  bool (*keyword_lex_fn)(TSLexer *, TSStateId);
+  // A lex function takes a 16-bit lex state in each ABI (tree-sitter-cpp fork).
+  bool (*lex_fn)(TSLexer *, uint16_t);
+  bool (*keyword_lex_fn)(TSLexer *, uint16_t);
   TSSymbol keyword_capture_token;
   struct {
     const bool *states;
@@ -140,15 +170,40 @@ struct TSLanguage {
     unsigned (*serialize)(void *, char *);
     void (*deserialize)(void *, const char *, unsigned);
   } external_scanner;
-  const TSStateId *primary_state_ids;
+  // A state id has 16 bits in ABI 14 and 15, and 32 bits in the ABI of the tree-sitter-cpp fork.
+  const void *primary_state_ids;
   const char *name;
   const TSSymbol *reserved_words;
+  // A reserved word set has a maximum of 65,535 words.
   uint16_t max_reserved_word_set_size;
   uint32_t supertype_count;
   const TSSymbol *supertype_symbols;
   const TSMapSlice *supertype_map_slices;
   const TSSymbol *supertype_map_entries;
   TSLanguageMetadata metadata;
+  // The parse tables of ABI 1016, in the shape layout (tree-sitter-cpp fork). A GROUP of a state is a
+  // maximal set of symbols that share one table value. The SHAPE of a state is the ordered list of its
+  // symbols together with the group of each symbol. Many states share one shape, and a column of a
+  // shape is frequently one value for each state of that shape.
+  //
+  // `state_shape[state]` gives the shape. The range `shape_offset[shape]` thru `shape_offset[shape+1]`
+  // of `shape_symbols` and of `shape_slots` holds the symbols of that shape and the storage slot of
+  // the group of each symbol. The symbols are in the order in which the runtime reads them: ascending
+  // symbol for a state below `large_state_count`, and group order for a state above it. A slot below
+  // `shape_nvar[shape]` reads `state_values[state_value_offset[state] + slot]`, and a higher slot
+  // reads `shape_const[shape_const_offset[shape] + slot - shape_nvar[shape]]`.
+  //
+  // A language of a lower ABI version keeps these nine pointers null. The runtime must read one of
+  // them only after a test of the ABI version. Refer to `ts_language_lookup` in language.h.
+  const TSSymbol *shape_symbols;
+  const uint16_t *shape_slots;
+  const uint32_t *shape_offset;
+  const uint16_t *shape_nvar;
+  const uint32_t *shape_const;
+  const uint32_t *shape_const_offset;
+  const uint32_t *state_shape;
+  const uint32_t *state_value_offset;
+  const uint32_t *state_values;
 };
 
 static inline bool set_contains(const TSCharacterRange *ranges, uint32_t len, int32_t lookahead) {
@@ -233,21 +288,23 @@ static inline bool set_contains(const TSCharacterRange *ranges, uint32_t len, in
 
 #define ACTIONS(id) id
 
-#define SHIFT(state_value)            \
-  {{                                  \
-    .shift = {                        \
-      .type = TSParseActionTypeShift, \
-      .state = (state_value)          \
-    }                                 \
+#define SHIFT(state_value)                          \
+  {{                                                \
+    .shift = {                                      \
+      .type = TSParseActionTypeShift,               \
+      .state_low = (uint16_t)(state_value),         \
+      .state_high = (uint16_t)((state_value) >> 16) \
+    }                                               \
   }}
 
-#define SHIFT_REPEAT(state_value)     \
-  {{                                  \
-    .shift = {                        \
-      .type = TSParseActionTypeShift, \
-      .state = (state_value),         \
-      .repetition = true              \
-    }                                 \
+#define SHIFT_REPEAT(state_value)                    \
+  {{                                                 \
+    .shift = {                                       \
+      .type = TSParseActionTypeShift,                \
+      .state_low = (uint16_t)(state_value),          \
+      .state_high = (uint16_t)((state_value) >> 16), \
+      .repetition = true                             \
+    }                                                \
   }}
 
 #define SHIFT_EXTRA()                 \

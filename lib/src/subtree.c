@@ -172,15 +172,17 @@ Subtree ts_subtree_new_leaf(
   TSSymbolMetadata metadata = ts_language_symbol_metadata(language, symbol);
   bool extra = symbol == ts_builtin_sym_end;
 
+  // The inline struct keeps the parse state in 16 bits (tree-sitter-cpp fork).
   bool is_inline = (
     symbol <= UINT8_MAX &&
+    parse_state < UINT16_MAX &&
     !has_external_tokens &&
     ts_subtree_can_inline(padding, size, lookahead_bytes)
   );
 
   if (is_inline) {
     return (Subtree) {{
-      .parse_state = parse_state,
+      .parse_state = (uint16_t)parse_state,
       .symbol = symbol,
       .padding_bytes = padding.bytes,
       .padding_rows = padding.extent.row,
@@ -337,11 +339,73 @@ void ts_subtree_compress(
 
 // The part of an error node's cost that penalizes the extent it spans, as
 // opposed to the cost of its contents.
-static inline uint32_t ts_subtree__error_extent_cost(Length size) {
+static inline uint64_t ts_subtree__error_extent_cost(Length size) {
   return
     ERROR_COST_PER_RECOVERY +
-    ERROR_COST_PER_SKIPPED_CHAR * size.bytes +
-    ERROR_COST_PER_SKIPPED_LINE * size.extent.row;
+    (uint64_t)ERROR_COST_PER_SKIPPED_CHAR * size.bytes +
+    (uint64_t)ERROR_COST_PER_SKIPPED_LINE * size.extent.row;
+}
+
+static inline bool ts_subtree__is_error_symbol(TSSymbol symbol) {
+  return symbol == ts_builtin_sym_error || symbol == ts_builtin_sym_error_repeat;
+}
+
+// The unmatched brackets of a subtree in an ERROR node. A token counts if its name is a bracket.
+// An ERROR node gives its own counts. Other nodes give zero (tree-sitter-cpp fork).
+static UnmatchedBrackets ts_subtree__unmatched_brackets(Subtree self, const TSLanguage *language) {
+  UnmatchedBrackets result = {0, 0, 0, 0};
+  TSSymbol symbol = ts_subtree_symbol(self);
+  if (ts_subtree_child_count(self) > 0) {
+    if (ts_subtree__is_error_symbol(symbol)) result = self.ptr->unmatched;
+    return result;
+  }
+  if (symbol >= language->token_count) return result;
+  const char *name = ts_language_symbol_name(language, symbol);
+  if (!name || name[0] == 0 || name[1] != 0) return result;
+  switch (name[0]) {
+    case '{': result.left_braces = 1; break;
+    case '}': result.right_braces = 1; break;
+    case '(': case '[': result.left_parentheses = 1; break;
+    case ')': case ']': result.right_parentheses = 1; break;
+    default: break;
+  }
+  return result;
+}
+
+static inline uint16_t ts_subtree__saturate(uint32_t count) {
+  return count > UINT16_MAX ? UINT16_MAX : (uint16_t)count;
+}
+
+// Append the unmatched brackets of a following subtree. The right brackets of `next` match the
+// left brackets of `self` first (tree-sitter-cpp fork).
+static void ts_subtree__append_unmatched(UnmatchedBrackets *self, UnmatchedBrackets next) {
+  uint16_t braces = self->left_braces < next.right_braces ? self->left_braces : next.right_braces;
+  self->left_braces = ts_subtree__saturate((uint32_t)self->left_braces - braces + next.left_braces);
+  self->right_braces = ts_subtree__saturate((uint32_t)self->right_braces + next.right_braces - braces);
+  uint16_t parentheses =
+    self->left_parentheses < next.right_parentheses ? self->left_parentheses : next.right_parentheses;
+  self->left_parentheses = ts_subtree__saturate((uint32_t)self->left_parentheses - parentheses + next.left_parentheses);
+  self->right_parentheses = ts_subtree__saturate((uint32_t)self->right_parentheses + next.right_parentheses - parentheses);
+}
+
+static inline uint32_t ts_subtree__unmatched_cost(UnmatchedBrackets unmatched) {
+  return
+    ERROR_COST_PER_UNMATCHED_BRACE * unmatched.right_braces +
+    ERROR_COST_PER_UNMATCHED_PARENTHESIS * unmatched.right_parentheses;
+}
+
+// The increase of the unmatched bracket cost of an ERROR node that also holds `tree` after its
+// children. `error` can be NULL_SUBTREE, or a subtree that is not an ERROR node. O(1)
+// (tree-sitter-cpp fork).
+uint32_t ts_subtree_unmatched_bracket_cost_after(Subtree error, Subtree tree, const TSLanguage *language) {
+  UnmatchedBrackets unmatched = {0, 0, 0, 0};
+  if (error.ptr && ts_subtree_child_count(error) > 0 && ts_subtree__is_error_symbol(ts_subtree_symbol(error))) {
+    unmatched = error.ptr->unmatched;
+  }
+  uint32_t before = ts_subtree__unmatched_cost(unmatched);
+  ts_subtree__append_unmatched(&unmatched, ts_subtree__unmatched_brackets(tree, language));
+  uint32_t after = ts_subtree__unmatched_cost(unmatched);
+  return after > before ? after - before : 0;
 }
 
 // Assign all of the node's properties that depend on its children.
@@ -360,14 +424,33 @@ void ts_subtree_summarize_children(
   self.ptr->depends_on_column = false;
   self.ptr->has_external_scanner_state_change = false;
   self.ptr->dynamic_precedence = 0;
+  self.ptr->unmatched = (UnmatchedBrackets) {0, 0, 0, 0};
 
   uint32_t structural_index = 0;
   const TSSymbol *alias_sequence = ts_language_alias_sequence(language, self.ptr->production_id);
   uint32_t lookahead_end_byte = 0;
+  bool is_error = ts_subtree__is_error_symbol(self.ptr->symbol);
+  UnmatchedBrackets unmatched = {0, 0, 0, 0};
+  uint64_t unmatched_cost_of_children = 0;
+  // The error cost of the node in 64 bits. A child with the cost ERROR_COST_MAX gives that cost to
+  // the node. Refer to ERROR_COST_MAX in error_costs.h (tree-sitter-cpp fork).
+  uint64_t error_cost = 0;
+  bool is_saturated = false;
 
   const Subtree *children = ts_subtree_children(self);
   for (uint32_t i = 0; i < self.ptr->child_count; i++) {
     Subtree child = children[i];
+
+    // The unmatched brackets of an ERROR child can match brackets of the other children. This
+    // node removes the bracket costs of its children, and adds the cost of the brackets that stay
+    // unmatched (tree-sitter-cpp fork).
+    if (is_error) {
+      UnmatchedBrackets child_unmatched = ts_subtree__unmatched_brackets(child, language);
+      if (ts_subtree_child_count(child) > 0) {
+        unmatched_cost_of_children += ts_subtree__unmatched_cost(child_unmatched);
+      }
+      ts_subtree__append_unmatched(&unmatched, child_unmatched);
+    }
 
     if (
       self.ptr->size.extent.row == 0 &&
@@ -396,23 +479,25 @@ void ts_subtree_summarize_children(
     }
 
     uint32_t grandchild_count = ts_subtree_child_count(child);
+    uint32_t child_error_cost = ts_subtree_error_cost(child);
+    if (child_error_cost == ERROR_COST_MAX) is_saturated = true;
     if (ts_subtree_symbol(child) == ts_builtin_sym_error_repeat) {
       // Refund an `_ERROR` child's extent penalty, which this node re-charges
       // as part of its own extent below, so that the grouping is cost-neutral.
-      uint32_t extent_cost = ts_subtree__error_extent_cost(ts_subtree_size(child));
-      ts_assert(ts_subtree_error_cost(child) >= extent_cost);
-      self.ptr->error_cost += ts_subtree_error_cost(child) - extent_cost;
+      uint64_t extent_cost = ts_subtree__error_extent_cost(ts_subtree_size(child));
+      ts_assert(child_error_cost == ERROR_COST_MAX || child_error_cost >= extent_cost);
+      if (child_error_cost >= extent_cost) error_cost += child_error_cost - extent_cost;
     } else {
-      self.ptr->error_cost += ts_subtree_error_cost(child);
+      error_cost += child_error_cost;
       if (
         self.ptr->symbol == ts_builtin_sym_error ||
         self.ptr->symbol == ts_builtin_sym_error_repeat
       ) {
         if (!ts_subtree_extra(child) && !(ts_subtree_is_error(child) && grandchild_count == 0)) {
           if (ts_subtree_visible(child)) {
-            self.ptr->error_cost += ERROR_COST_PER_SKIPPED_TREE;
+            error_cost += ERROR_COST_PER_SKIPPED_TREE;
           } else if (grandchild_count > 0) {
-            self.ptr->error_cost += ERROR_COST_PER_SKIPPED_TREE * child.ptr->visible_child_count;
+            error_cost += (uint64_t)ERROR_COST_PER_SKIPPED_TREE * child.ptr->visible_child_count;
           }
         }
       }
@@ -448,6 +533,15 @@ void ts_subtree_summarize_children(
       self.ptr->parse_state = TS_TREE_STATE_NONE;
     }
 
+    // A child in the middle is fragile when the parser made it with more than one version. The
+    // order and the merges of those versions depend on the versions outside the node, and a
+    // different parse can select a different tree for the same text. The incremental parse then
+    // must not reuse this node as one subtree. Only the reuse of nodes reads these flags
+    // (tree-sitter-cpp fork).
+    if (ts_subtree_is_fragile(child)) {
+      self.ptr->fragile_left = self.ptr->fragile_right = true;
+    }
+
     if (!ts_subtree_extra(child)) structural_index++;
   }
 
@@ -457,8 +551,19 @@ void ts_subtree_summarize_children(
     self.ptr->symbol == ts_builtin_sym_error ||
     self.ptr->symbol == ts_builtin_sym_error_repeat
   ) {
-    self.ptr->error_cost += ts_subtree__error_extent_cost(self.ptr->size);
+    error_cost += ts_subtree__error_extent_cost(self.ptr->size);
   }
+
+  // Each ERROR child adds the cost of its unmatched brackets to its own cost. The sum of the children
+  // is then at least the sum of these costs, unless a child has the cost ERROR_COST_MAX
+  // (tree-sitter-cpp fork).
+  if (is_error) {
+    ts_assert(is_saturated || error_cost >= unmatched_cost_of_children);
+    error_cost = error_cost >= unmatched_cost_of_children ? error_cost - unmatched_cost_of_children : 0;
+    error_cost += ts_subtree__unmatched_cost(unmatched);
+    self.ptr->unmatched = unmatched;
+  }
+  self.ptr->error_cost = is_saturated ? ERROR_COST_MAX : ts_error_cost_saturate(error_cost);
 
   if (self.ptr->child_count > 0) {
     Subtree first_child = children[0];
@@ -1023,7 +1128,7 @@ void ts_subtree__print_dot_graph(const Subtree *self, uint32_t start_offset,
 
   fprintf(f, ", tooltip=\""
     "range: %u - %u\n"
-    "state: %d\n"
+    "state: %u\n"
     "error-cost: %u\n"
     "has-changes: %u\n"
     "depends-on-column: %u\n"

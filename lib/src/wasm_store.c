@@ -1312,7 +1312,7 @@ error:
   return false;
 }
 
-static bool ts_wasm_store__sentinel_lex_fn(TSLexer *_lexer, TSStateId state) {
+static bool ts_wasm_store__sentinel_lex_fn(TSLexer *_lexer, uint16_t state) {
   return false;
 }
 
@@ -1377,9 +1377,11 @@ const TSLanguage *ts_wasm_store_load_language(
   if (!wasm_memory__read(&wasm_memory, language_address, &abi_version, sizeof(abi_version))) {
     goto invalid_language_memory;
   }
+  // `LanguageInWasmMemory` mirrors the fields of TSLanguage thru ABI 1015 only. A wasm language in
+  // the shape layout is not read, because the mirror has no shape pointers (tree-sitter-cpp fork).
   if (
     abi_version < TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION ||
-    abi_version > TREE_SITTER_LANGUAGE_VERSION
+    abi_version > LANGUAGE_VERSION_WITH_WIDE_TABLES
   ) {
     wasm_error->kind = TSWasmErrorKindInstantiate;
     format(
@@ -1387,7 +1389,7 @@ const TSLanguage *ts_wasm_store_load_language(
       "incompatible language ABI version %u; expected between %u and %u",
       abi_version,
       TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION,
-      TREE_SITTER_LANGUAGE_VERSION
+      LANGUAGE_VERSION_WITH_WIDE_TABLES
     );
     goto error;
   }
@@ -1457,7 +1459,8 @@ const TSLanguage *ts_wasm_store_load_language(
     .parse_table = copy(
       &wasm_memory,
       wasm_language.parse_table,
-      wasm_language.large_state_count * wasm_language.symbol_count * sizeof(uint16_t),
+      wasm_language.large_state_count * wasm_language.symbol_count *
+        (wasm_language.abi_version >= LANGUAGE_VERSION_WITH_WIDE_TABLES ? sizeof(uint32_t) : sizeof(uint16_t)),
       &valid_wasm_memory
     ),
     .parse_actions = copy_unsized_static_array(
@@ -1624,7 +1627,8 @@ const TSLanguage *ts_wasm_store_load_language(
     language->primary_state_ids = copy(
       &wasm_memory,
       wasm_language.primary_state_ids,
-      wasm_language.state_count * sizeof(TSStateId),
+      wasm_language.state_count *
+        (wasm_language.abi_version >= LANGUAGE_VERSION_WITH_WIDE_TABLES ? sizeof(uint32_t) : sizeof(uint16_t)),
       &valid_wasm_memory
     );
     if (!valid_wasm_memory) goto invalid_language_memory;
