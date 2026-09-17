@@ -535,7 +535,10 @@ fn test_parsing_after_editing_end_of_code() {
         )
     );
 
-    assert_eq!(recorder.strings_read(), vec![" * ", "abc.d)",]);
+    // The runtime of tree-sitter-cpp reuses more of the old tree (tree-sitter-cpp commit 5882494, patch
+    // 10-incremental-reuse), so this parse does not read " * " again. The tree above is the tree of a
+    // fresh parse.
+    assert_eq!(recorder.strings_read(), vec![" abc.d)"]);
 }
 
 #[test]
