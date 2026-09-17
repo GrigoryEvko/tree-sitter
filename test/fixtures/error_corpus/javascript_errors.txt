@@ -52,8 +52,8 @@ e f;
 (program
   (if_statement
     (parenthesized_expression
-      (identifier)
-      (ERROR (identifier)))
+      (ERROR (identifier))
+      (identifier))
     (statement_block
       (ERROR (identifier))
       (expression_statement (identifier))))
