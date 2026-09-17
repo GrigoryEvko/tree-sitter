@@ -72,7 +72,7 @@ fn test_lookahead_iterator_exhaustion() {
     let language = get_language("json");
 
     for state in 0..language.parse_state_count() {
-        let state = u16::try_from(state).unwrap();
+        let state = u32::try_from(state).unwrap();
         let mut lookahead = language.lookahead_iterator(state).unwrap();
 
         // A fresh iterator is not positioned on a symbol.
