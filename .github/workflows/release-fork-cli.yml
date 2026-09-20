@@ -1,0 +1,196 @@
+# Release the CLI of this fork, with no grammar.
+#
+# The kit of `GrigoryEvko/tree-sitter-cpp` holds this CLI together with the C++ grammar. This release
+# holds the CLI alone, for a person who generates another grammar with the generator of this fork, or
+# who runs this runtime with another grammar.
+#
+# Start it with a tag of the form `v0.27.0-cpp-fork.N`, or by hand from the Actions tab.
+name: Release the fork CLI
+
+on:
+  push:
+    tags:
+      - 'v*-cpp-fork.*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'The tag to release, for example v0.27.0-cpp-fork.6'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  RUST_TOOLCHAIN: '1.90.0'
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each runner builds for itself, because each job runs the CLI that it builds.
+          - { platform: linux-x64,   os: ubuntu-24.04 }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm }
+          - { platform: macos-arm64, os: macos-15 }
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+
+      - name: Name the tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "name=${{ github.event.inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      # `--locked` refuses a dependency that the lock file does not name. A release that resolves a
+      # new version is not reproducible.
+      - name: Build the CLI
+        run: cargo build --release --locked -p tree-sitter-cli
+
+      # A STOCK CLI FAILS THIS TEST. The generator of this fork writes ABI 1019 and no other, and the
+      # published generator writes 14 or 15. The test also covers the default of the `--abi` flag,
+      # which named a version that this generator refuses.
+      - name: Test that the CLI holds the generator of the fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli="$PWD/target/release/tree-sitter"
+          "$cli" --version
+          mkdir -p /tmp/tiny && cd /tmp/tiny
+          cat > grammar.js <<'JS'
+          module.exports = grammar({
+            name: 'tiny',
+            rules: { source_file: $ => repeat($.word), word: $ => /[a-z]+/ }
+          });
+          JS
+          # No flag. A published CLI writes ABI 15 here, and this one writes 1019.
+          "$cli" generate
+          abi=$(grep -m1 -oP '(?<=#define LANGUAGE_VERSION )\d+' src/parser.c)
+          echo "the generator wrote ABI $abi with no flag"
+          test "$abi" = 1019
+          rm -rf src
+          "$cli" generate --abi=latest
+          abi=$(grep -m1 -oP '(?<=#define LANGUAGE_VERSION )\d+' src/parser.c)
+          echo "the generator wrote ABI $abi for --abi=latest"
+          test "$abi" = 1019
+
+      - name: Assemble the kit
+        id: kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="tree-sitter-fork-${{ steps.tag.outputs.name }}-${{ matrix.platform }}"
+          mkdir -p "$name/bin"
+          cp target/release/tree-sitter "$name/bin/"
+          cp LICENSE "$name/"
+          {
+            echo "kit                $name"
+            echo "platform           ${{ matrix.platform }}"
+            echo "runner             ${{ matrix.os }}"
+            echo "runtime_repo       ${{ github.repository }}"
+            echo "runtime_commit     ${{ github.sha }}"
+            echo "runtime_tag        ${{ steps.tag.outputs.name }}"
+            echo "generated_abi      1019"
+            echo "rust_toolchain     ${{ env.RUST_TOOLCHAIN }}"
+            echo "built_at           $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run       ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > "$name/MANIFEST.txt"
+          cat "$name/MANIFEST.txt"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.kit.outputs.name }}
+          path: |
+            ${{ steps.kit.outputs.name }}.tar.gz
+            ${{ steps.kit.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Release on GitHub
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Name the tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "name=${{ github.event.inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect the kits
+        uses: actions/download-artifact@v4
+        with:
+          path: kits
+          merge-multiple: true
+
+      - name: Write the notes
+        run: |
+          set -euo pipefail
+          cd kits
+          cat *.sha256 > SHA256SUMS
+          {
+            echo "The tree-sitter CLI of the C++ fork, with no grammar."
+            echo
+            echo "This CLI carries the runtime and the generator of the fork. Take it to generate"
+            echo "another grammar with the tables of the fork, or to run this runtime with another"
+            echo "grammar. To parse C++, take a kit of GrigoryEvko/tree-sitter-cpp instead, because"
+            echo "that kit holds the grammar already compiled."
+            echo
+            echo "| input | value |"
+            echo "|---|---|"
+            echo "| runtime commit | \`${{ github.sha }}\` |"
+            echo "| ABI that the generator writes | 1019 |"
+            echo "| toolchain | Rust ${{ env.RUST_TOOLCHAIN }} |"
+            echo
+            echo '## Use it'
+            echo
+            echo '```sh'
+            echo "tag=${{ steps.tag.outputs.name }}"
+            echo 'kit=tree-sitter-fork-$tag-linux-x64'
+            echo "url=${{ github.server_url }}/${{ github.repository }}/releases/download/\$tag"
+            echo 'curl -sSfL "$url/$kit.tar.gz" -o kit.tar.gz'
+            echo 'curl -sSfL "$url/SHA256SUMS" -o SHA256SUMS'
+            echo 'grep " $kit.tar.gz$" SHA256SUMS | sha256sum -c -'
+            echo 'tar xzf kit.tar.gz'
+            echo '"$PWD/$kit/bin/tree-sitter" generate'
+            echo '```'
+            echo
+            echo 'The generator of this fork writes ABI 1019 and no other version. A runtime of the'
+            echo 'published project refuses that ABI, so a parser that this CLI generates runs under'
+            echo 'this CLI and under the runtime of the fork.'
+            echo
+            echo 'The Linux kits need glibc 2.39 or a later version.'
+          } > NOTES.md
+          cat NOTES.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd kits
+          gh release create "${{ steps.tag.outputs.name }}" \
+            --repo "${{ github.repository }}" \
+            --title "Fork CLI ${{ steps.tag.outputs.name }}" \
+            --notes-file NOTES.md \
+            *.tar.gz SHA256SUMS
