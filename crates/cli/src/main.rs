@@ -40,7 +40,11 @@ use tree_sitter_tags::TagsContext;
 
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_SHA: Option<&'static str> = option_env!("BUILD_SHA");
-const DEFAULT_GENERATE_ABI_VERSION: usize = 15;
+// The generator of this fork writes one ABI, and `ABI_VERSION_MIN` equals `ABI_VERSION_MAX` in
+// `crates/generate/src/render.rs`. The upstream default of 15 made each `tree-sitter generate` with
+// no flag stop with "can only generate parsers with ABI version 1019 - 1019, not 15"
+// (tree-sitter-cpp fork).
+const DEFAULT_GENERATE_ABI_VERSION: usize = tree_sitter_generate::ABI_VERSION_MAX;
 
 #[derive(Subcommand)]
 #[command(about="Generates and tests parsers", author=crate_authors!("\n"), styles=get_styles())]
