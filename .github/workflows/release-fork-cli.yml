@@ -78,12 +78,12 @@ jobs:
           JS
           # No flag. A published CLI writes ABI 15 here, and this one writes 1019.
           "$cli" generate
-          abi=$(grep -m1 -oP '(?<=#define LANGUAGE_VERSION )\d+' src/parser.c)
+          abi=$(grep -m1 'define LANGUAGE_VERSION' src/parser.c | tr -dc '0-9')
           echo "the generator wrote ABI $abi with no flag"
           test "$abi" = 1019
           rm -rf src
           "$cli" generate --abi=latest
-          abi=$(grep -m1 -oP '(?<=#define LANGUAGE_VERSION )\d+' src/parser.c)
+          abi=$(grep -m1 'define LANGUAGE_VERSION' src/parser.c | tr -dc '0-9')
           echo "the generator wrote ABI $abi for --abi=latest"
           test "$abi" = 1019
 
